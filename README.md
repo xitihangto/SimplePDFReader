@@ -42,12 +42,13 @@
 1. 前往仓库右侧 **Releases** 页面下载最新的 `SimplePDFReader-macOS-arm64.zip` 并解压。
    > **架构说明**：该产物由 GitHub Actions 在 `macos-14`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式二」从源码编译。
 2. 将解压出的 `SimplePDFReader.app` 拖入 `/Applications`（应用程序）目录或任意位置双击运行。
-3. **首次打开安全提示说明**：由于应用采用开源本地签名，从网络下载后若遇到 macOS 提示“无法验证开发者”，可通过以下任一方式放行：
-   - **系统设置放行**：打开「系统设置 → 隐私与安全性」，滑至底部点击 **「仍要打开」**。
+3. **首次打开安全提示说明**：该产物为本地（ad-hoc）签名、未经 Apple 公证。从网络下载后 macOS 会拦截一次，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。放行方式二选一：
+   - **系统设置放行**：先在 Finder 里双击一次以触发拦截（保持提示框不要关掉），再打开「系统设置 → 隐私与安全性」，向下滚动到「安全性」，点 **「仍要打开」**，输入登录密码确认。该按钮在被拦截后 **1 小时内**有效；放行后此 App 会被记为安全性例外，之后可正常双击打开。
    - **终端一键解除隔离**：在终端执行以下命令清除下载隔离属性后即可直接双击打开：
      ```bash
      xattr -cr /Applications/SimplePDFReader.app
      ```
+   > ⚠️ **macOS 15 Sequoia 及更高版本已移除「按住 Control 点击 → 打开」的绕过方式**，不要再依赖右键放行。
 
 ### 方式二：从源码一键编译（推荐，本机编译零安全弹窗）
 
@@ -94,12 +95,35 @@ APP_VERSION=1.2.3 ./build_app.sh
 - **系统**：macOS 13.0 或更高，**Apple Silicon（arm64）机型**（`build_app.sh` 目前按 arm64 目标编译，Intel Mac 不适用）。
 - **工具链**：Xcode 或 Xcode Command Line Tools 均可，**无需完整 Xcode**。
 
+#### 全新 Mac 从零准备清单
+
+如果目标机器是**刚装好系统、没装过任何开发工具**的新 Mac，按下面顺序操作。全程**不需要** Apple 开发者账号（无需 99 美元/年），也**不需要** GitHub 账号（公开仓库可匿名克隆）。
+
+| 顺序 | 操作 | 说明 |
+| :--- | :--- | :--- |
+| 1 | 确认机型 | 必须 Apple Silicon（M 系列）。「  → 关于本机」查看「芯片」 |
+| 2 | 确认系统 | macOS 13.0 或更高 |
+| 3 | 安装命令行工具 | 打开「终端」执行 `xcode-select --install`，在弹窗中点「安装」并同意许可。约 1–3 GB，视网速 5–20 分钟 |
+| 4 | 克隆源码 | `git clone https://github.com/xitihangto/SimplePDFReader.git` |
+| 5 | 构建 | `cd SimplePDFReader && chmod +x build_app.sh && ./build_app.sh` |
+| 6 | 安装 | `mv ../SimplePDFReader.app /Applications/` |
+
+**注意事项**：
+
+- 第 3 步之前 **`git` 命令是不存在的**（`git` 由命令行工具提供）。新 Mac 上直接敲 `git clone` 会弹出「安装命令行工具」的提示框——这是最容易卡住的地方，先装好工具链再往下走。
+- 若第 5 步报 `You have not agreed to the Xcode license agreements`，执行 `sudo xcodebuild -license accept`。
+- 磁盘预留约 3 GB（命令行工具 + 构建产物）。
+- **登录 Apple ID 与构建无关**，登不登都可以。
+- **不要**用浏览器「Download ZIP」下载源码，否则产物会带隔离属性。
+- 构建完成后若把 `.app` 通过 **AirDrop / 邮件 / 网盘**发给别的 Mac，接收方会被重新打上隔离属性并弹窗——这种情况才需要按「方式一」的步骤放行。
+
 #### 常见问题
 
 | 现象 | 处理方式 |
 | :--- | :--- |
 | `You have not agreed to the Xcode license agreements` | 执行 `sudo xcodebuild -license accept` |
 | `xcode-select: error: no developer tools were found` | 执行 `xcode-select --install` |
+| `git: command not found` | 命令行工具尚未安装，执行 `xcode-select --install` |
 | 想确认签名是否正确 | `codesign --verify --verbose=2 /Applications/SimplePDFReader.app`，输出 `valid on disk` 与 `satisfies its Designated Requirement` 即正确 |
 
 ## 发版流程（维护者）
