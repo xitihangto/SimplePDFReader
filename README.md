@@ -38,12 +38,25 @@
 
 ## 安装与运行指南
 
-### 方式一：直接下载 Release 应用包
+三条路径任选其一。「**首次打开是否弹窗**」与「**是否需要装 Xcode**」是两个**互相独立**的代价，别把它们混在一起看：
+
+| 方式 | 需要 Xcode？ | 首次打开弹窗 | 适合谁 |
+| :--- | :--- | :--- | :--- |
+| **方式一**：浏览器下载 Release 产物 | 不需要 | ⚠️ 需放行一次 | 不想装任何开发工具，能接受点一次「仍要打开」 |
+| **方式二**：命令行下载 Release 产物 | 不需要 | ✅ 零弹窗 | 会用终端，想一步到位 |
+| **方式三**：从源码一键编译 | 需要（约 1–3 GB） | ✅ 零弹窗 | 想自行审计源码或修改代码 |
+
+> **弹窗到底由什么决定？**
+> 由扩展属性 `com.apple.quarantine`（隔离标记）决定：**浏览器下载会自动打上这个标记，`curl` / `git clone` 不会**。
+> 而 Gatekeeper 只在文件带该标记时才会在启动时介入检查 —— 所以「浏览器下载」有弹窗，「命令行下载」和「源码编译」都是零弹窗。
+> **是否需要 Xcode，则只取决于你是「下载现成产物」还是「自己编译」，与弹窗无关。**
+
+### 方式一：浏览器下载 Release 应用包
 
 1. 前往仓库右侧 **Releases** 页面下载最新的 `SimplePDFReader-macOS-arm64.zip` 并解压。
-   > **架构说明**：该产物由 GitHub Actions 在 `macos-14`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式二」从源码编译。
+   > **架构说明**：该产物由 GitHub Actions 在 `macos-14`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式三」从源码编译。
 2. 将解压出的 `SimplePDFReader.app` 拖入 `/Applications`（应用程序）目录或任意位置双击运行。
-3. **首次打开安全提示说明**：该产物为本地（ad-hoc）签名、未经 Apple 公证。从网络下载后 macOS 会拦截一次，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。放行方式二选一：
+3. **首次打开安全提示说明**：该产物为本地（ad-hoc）签名、未经 Apple 公证。从网络下载后 macOS 会拦截一次，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。放行方式有两种（任选其一）：
    - **系统设置放行**：先在 Finder 里双击一次以触发拦截（保持提示框不要关掉），再打开「系统设置 → 隐私与安全性」，向下滚动到「安全性」，点 **「仍要打开」**，输入登录密码确认。该按钮在被拦截后 **1 小时内**有效；放行后此 App 会被记为安全性例外，之后可正常双击打开。
    - **终端一键解除隔离**：在终端执行以下命令清除下载隔离属性后即可直接双击打开：
      ```bash
@@ -51,7 +64,35 @@
      ```
    > ⚠️ **macOS 15 Sequoia 及更高版本已移除「按住 Control 点击 → 打开」的绕过方式**，不要再依赖右键放行。
 
-### 方式二：从源码一键编译（推荐，本机编译零安全弹窗）
+### 方式二：命令行下载 Release 产物（免弹窗，无需 Xcode）
+
+如果你不介意开一次终端，这是**最省事**的路径 —— 既不用装 Xcode，也不会出现任何安全弹窗：
+
+```bash
+# 1. 下载最新版 Release 产物（curl 不会打上隔离标记）
+curl -L -o /tmp/SimplePDFReader.zip \
+  https://github.com/xitihangto/SimplePDFReader/releases/latest/download/SimplePDFReader-macOS-arm64.zip
+
+# 2. 解压
+unzip -o /tmp/SimplePDFReader.zip -d /tmp/SimplePDFReader
+
+# 3. 若已安装旧版，先移到废纸篓（避免覆盖时目录嵌套）
+mv /Applications/SimplePDFReader.app ~/.Trash/ 2>/dev/null
+
+# 4. 安装到应用程序目录
+mv /tmp/SimplePDFReader/SimplePDFReader.app /Applications/
+```
+
+**原理**：`curl` 不像浏览器那样给文件打上 `com.apple.quarantine` 属性，因此 Gatekeeper 在启动时不会介入评估，双击即开。
+
+安装后可自查以下两项：
+
+```bash
+codesign --verify --verbose=2 /Applications/SimplePDFReader.app   # 应输出 valid on disk
+xattr /Applications/SimplePDFReader.app                           # 不应出现 com.apple.quarantine
+```
+
+### 方式三：从源码一键编译（零弹窗，需装 Xcode）
 
 > **为什么本机编译不会被 Gatekeeper 拦截？**
 > macOS 的「无法验证开发者」弹窗只会出现在带有 `com.apple.quarantine`（隔离）属性的 App 上，
