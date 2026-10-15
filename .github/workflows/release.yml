@@ -1,0 +1,38 @@
+name: Build and Release macOS App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 版本号 (例如 v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build SimplePDFReader.app
+        run: |
+          chmod +x ./build_app.sh
+          OUTPUT_APP_PATH="$RUNNER_TEMP/SimplePDFReader.app" ./build_app.sh
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/SimplePDFReader.app" "$RUNNER_TEMP/SimplePDFReader-macOS-arm64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          name: SimplePDFReader ${{ github.event.inputs.tag_name || github.ref_name }}
+          body_path: CHANGELOG.md
+          files: ${{ runner.temp }}/SimplePDFReader-macOS-arm64.zip
+          draft: false
+          prerelease: false
