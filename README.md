@@ -38,6 +38,15 @@
 
 ## 安装与运行指南
 
+> ### 只是想用这个 app？你不需要安装任何开发工具
+>
+> **无论选哪条路径，都不需要 Xcode，也不需要命令行工具。** 只有想自己改代码的人才需要「方式三」。
+>
+> - **不想碰终端** → 走「方式一」：浏览器下载，首次打开时去「系统设置 → 隐私与安全性」点一次「仍要打开」。
+> - **愿意复制粘贴一条命令** → 走「方式二」：**零弹窗、零安装**，一步到位。
+>
+> 两条路都能正常使用，区别只是**你更愿意点一次设置，还是更愿意粘贴一次命令**。
+
 三条路径任选其一。「**首次打开是否弹窗**」与「**是否需要装 Xcode**」是两个**互相独立**的代价，别把它们混在一起看：
 
 | 方式 | 需要 Xcode？ | 首次打开弹窗 | 适合谁 |
@@ -66,7 +75,24 @@
 
 ### 方式二：命令行下载 Release 产物（免弹窗，无需 Xcode）
 
-如果你不介意开一次终端，这是**最省事**的路径 —— 既不用装 Xcode，也不会出现任何安全弹窗：
+如果你不介意开一次终端，这是**最省事**的路径 —— 既不用装 Xcode，也不会出现任何安全弹窗。
+
+**首次安装**：把下面这一整行复制进「终端」回车即可。
+
+```bash
+curl -L -o /tmp/app.zip https://github.com/xitihangto/SimplePDFReader/releases/latest/download/SimplePDFReader-macOS-arm64.zip && unzip -oq /tmp/app.zip -d /tmp/app && mv /tmp/app/SimplePDFReader.app /Applications/ && echo "✅ 已安装到「应用程序」"
+```
+
+> 找不到终端？按 `⌘ + 空格` 搜索「终端」，或从「启动台 → 其他 → 终端」打开。
+
+**如果已经装过旧版**，先执行下面这行移除旧版，再跑上面那条命令（否则新版会被塞进旧版的目录里）：
+
+```bash
+rm -rf /Applications/SimplePDFReader.app
+```
+
+<details>
+<summary>等价的分步版本（想知道每一步在做什么可以展开）</summary>
 
 ```bash
 # 1. 下载最新版 Release 产物（curl 不会打上隔离标记）
@@ -82,6 +108,8 @@ mv /Applications/SimplePDFReader.app ~/.Trash/ 2>/dev/null
 # 4. 安装到应用程序目录
 mv /tmp/SimplePDFReader/SimplePDFReader.app /Applications/
 ```
+
+</details>
 
 **原理**：`curl` 不像浏览器那样给文件打上 `com.apple.quarantine` 属性，因此 Gatekeeper 在启动时不会介入评估，双击即开。
 
