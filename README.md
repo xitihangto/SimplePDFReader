@@ -63,7 +63,7 @@
 ### 方式一：浏览器下载 Release 应用包
 
 1. 前往仓库右侧 **Releases** 页面下载最新的 `SimplePDFReader-macOS-arm64.zip` 并解压。
-   > **架构说明**：该产物由 GitHub Actions 在 `macos-14`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式三」从源码编译。
+   > **架构说明**：该产物由 GitHub Actions 在 `macos-15`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式三」从源码编译。
 2. 将解压出的 `SimplePDFReader.app` 拖入 `/Applications`（应用程序）目录或任意位置双击运行。
 3. **首次打开安全提示说明**：该产物为本地（ad-hoc）签名、未经 Apple 公证。从网络下载后 macOS 会拦截一次，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。放行方式有两种（任选其一）：
    - **系统设置放行**：先在 Finder 里双击一次以触发拦截（保持提示框不要关掉），再打开「系统设置 → 隐私与安全性」，向下滚动到「安全性」，点 **「仍要打开」**，输入登录密码确认。该按钮在被拦截后 **1 小时内**有效；放行后此 App 会被记为安全性例外，之后可正常双击打开。
@@ -223,7 +223,7 @@ git push --tags
 推送 tag 后，[`.github/workflows/release.yml`](.github/workflows/release.yml) 会自动：
 
 1. 解析 tag 作为版本号，并通过 `APP_VERSION` 注入到 App 的 `Info.plist`；
-2. 在 `macos-14`（Apple Silicon）运行器上执行 `./build_app.sh`，**从源码**编译出 `SimplePDFReader.app`；
+2. 在 `macos-15`（Apple Silicon）运行器上执行 `./build_app.sh`，**从源码**编译出 `SimplePDFReader.app`；
 3. **校验代码签名有效，且 `Info.plist` 中的版本号与 tag 一致**——任一不通过则构建直接失败，不会产出 Release；
 4. 打包为 `SimplePDFReader-macOS-arm64.zip`；
 5. 以 `CHANGELOG.md` 作为正文创建同名 Release，并附上该产物。

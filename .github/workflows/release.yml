@@ -16,8 +16,10 @@ permissions:
 
 jobs:
   build-and-release:
-    # 本项目仅支持 Apple Silicon（arm64），macos-14 运行器即 arm64
-    runs-on: macos-14
+    # 本项目仅支持 Apple Silicon（arm64）。官方 runner-images 对照表中，
+    # macOS 15 Arm64 对应标签即 macos-15（Intel 版是 macos-15-large）。
+    # 注意：macos-14 自 2026-07-06 起弃用、2026-11-02 完全停止支持，故已迁移。
+    runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
