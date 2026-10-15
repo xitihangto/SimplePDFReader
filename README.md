@@ -117,6 +117,17 @@ APP_VERSION=1.2.3 ./build_app.sh
 - **不要**用浏览器「Download ZIP」下载源码，否则产物会带隔离属性。
 - 构建完成后若把 `.app` 通过 **AirDrop / 邮件 / 网盘**发给别的 Mac，接收方会被重新打上隔离属性并弹窗——这种情况才需要按「方式一」的步骤放行。
 
+**关于「能不能一次粘贴执行」**：
+
+- **第 3 步必须单独执行，并等待它彻底装完。** `xcode-select --install` 是图形化异步安装——它只负责弹出安装窗口就立刻返回，真正的下载安装（5–20 分钟）在后台进行。如果把它和后面的命令一起粘贴，终端会**立刻**执行 `git clone`，而此时 `git` 尚未安装，必然失败。
+- **第 4～6 步可以合并成一条命令，一次粘贴执行**（用 `&&` 串联，任一环节失败会自动中断，不会带着错误继续往下跑）：
+
+```bash
+cd ~ && git clone https://github.com/xitihangto/SimplePDFReader.git && cd SimplePDFReader && chmod +x build_app.sh && ./build_app.sh && mv ../SimplePDFReader.app /Applications/ && echo "✅ 已安装到应用程序目录"
+```
+
+- 以下几项**必须交互，无法自动化**：命令行工具安装窗口本身、`sudo xcodebuild -license accept`（需要输入登录密码）。
+
 #### 常见问题
 
 | 现象 | 处理方式 |
