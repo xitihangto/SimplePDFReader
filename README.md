@@ -49,17 +49,52 @@
      xattr -cr /Applications/SimplePDFReader.app
      ```
 
-### 方式二：从源码一键编译（本机编译零安全弹窗）
+### 方式二：从源码一键编译（推荐，本机编译零安全弹窗）
 
-- **环境要求**：macOS 13.0+，已安装 Xcode 或 Xcode Command Line Tools（`xcode-select --install`）。
-- **一键生成图标并打包 `.app`**：
-  ```bash
-  git clone <仓库地址>
-  cd SimplePDFReader
-  chmod +x build_app.sh
-  ./build_app.sh
-  ```
-  脚本会自动使用 CoreGraphics 渲染 `1024×1024` 红色系高清图标、封装多分辨率 `AppIcon.icns`，并在上级目录生成可直接双击运行的 `SimplePDFReader.app`。
+> **为什么本机编译不会被 Gatekeeper 拦截？**
+> macOS 的「无法验证开发者」弹窗只会出现在带有 `com.apple.quarantine`（隔离）属性的 App 上，
+> 而这个属性是**浏览器和下载工具**在保存文件时打上的。
+> 用 `git clone` 取得源码并在本机编译，产出的 `.app` 天然不带隔离属性，
+> 因此**不会触发任何安全弹窗**，双击即可运行。
+
+> ⚠️ **务必使用 `git clone`，不要用网页上的「Download ZIP」按钮。**
+> 经浏览器下载的 ZIP 会被打上隔离属性，解压后再编译，产出的 `.app` 仍可能弹窗。
+
+#### 操作步骤
+
+```bash
+# 0. 准备工具链（已装过可跳过）
+#    若报 "You have not agreed to the Xcode license agreements"，执行：
+sudo xcodebuild -license accept
+
+# 1. 克隆源码（不要用 Download ZIP）
+git clone https://github.com/xitihangto/SimplePDFReader.git
+cd SimplePDFReader
+
+# 2. 一键构建（自动编译 + 本地签名）
+chmod +x build_app.sh
+./build_app.sh
+
+# 3. 安装到应用程序目录
+mv ../SimplePDFReader.app /Applications/
+```
+
+脚本会自动完成：用 CoreGraphics 渲染 `1024×1024` 高清图标并封装 `AppIcon.icns` → 编译 Swift 源码 → 清除扩展属性 → 执行本地（ad-hoc）签名并校验，最后在**仓库的上级目录**生成 `SimplePDFReader.app`。
+
+终端输出 `构建完成（已本地签名并通过校验）` 即为成功。
+
+#### 环境要求
+
+- **系统**：macOS 13.0 或更高，**Apple Silicon（arm64）机型**（`build_app.sh` 目前按 arm64 目标编译，Intel Mac 不适用）。
+- **工具链**：Xcode 或 Xcode Command Line Tools 均可，**无需完整 Xcode**。
+
+#### 常见问题
+
+| 现象 | 处理方式 |
+| :--- | :--- |
+| `You have not agreed to the Xcode license agreements` | 执行 `sudo xcodebuild -license accept` |
+| `xcode-select: error: no developer tools were found` | 执行 `xcode-select --install` |
+| 想确认签名是否正确 | `codesign --verify --verbose=2 /Applications/SimplePDFReader.app`，输出 `valid on disk` 与 `satisfies its Designated Requirement` 即正确 |
 
 ## 发版流程（维护者）
 
