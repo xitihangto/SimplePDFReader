@@ -1,5 +1,17 @@
 # 版本更新记录 (Changelog)
 
+## [v1.1.0] - 2026-10-15
+
+### 应用内署名 (In-App Attribution)
+
+- **自定义「关于」面板**：菜单栏「SimplePDFReader → 关于 SimplePDFReader」不再弹出系统默认的简易关于框，改为应用自绘面板，集中展示：
+  - 应用图标、名称与副标题；
+  - 当前版本号与构建号（读取 `Info.plist`，由构建脚本按 git tag 注入，不再硬编码）；
+  - 作者信息 `xitihangto`；
+  - 可点击的仓库链接 `xitihangto/SimplePDFReader`（点击用系统默认浏览器打开）。
+- **便捷操作**：面板内提供「复制仓库地址」与「在 GitHub 上查看」两个快捷按钮，方便他人获取源码。
+- **版权信息**：`Info.plist` 新增 `NSHumanReadableCopyright` 字段，写入 `Copyright © 2026 xitihangto · github.com/xitihangto/SimplePDFReader`。
+
 ## [v1.0.0] - 2026-10-15
 
 ### 初始正式版发布 (Initial Release)

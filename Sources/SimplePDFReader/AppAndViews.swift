@@ -977,6 +977,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - 关于面板
+
+/// 应用元信息：集中定义作者与仓库信息，便于统一维护
+enum AppMetadata {
+    static let displayName = "SimplePDFReader"
+    static let tagline = "macOS 原生极简 PDF 阅读器"
+    static let authorName = "xitihangto"
+    static let repositoryName = "xitihangto/SimplePDFReader"
+    static let repositoryURLString = "https://github.com/xitihangto/SimplePDFReader"
+
+    /// 形如 "1.1.0"，来自 Info.plist（由 build_app.sh 依据 git tag 注入）
+    static var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+    }
+
+    static var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    }
+
+    static var repositoryURL: URL? {
+        URL(string: repositoryURLString)
+    }
+}
+
+/// 自定义「关于」窗口的内容视图
+private struct AboutView: View {
+    let icon: NSImage
+    var onClose: () -> Void
+
+    @State private var didCopy = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 92, height: 92)
+                .padding(.top, 26)
+
+            Text(AppMetadata.displayName)
+                .font(.system(size: 20, weight: .semibold))
+                .padding(.top, 14)
+
+            Text(AppMetadata.tagline)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+
+            Text("版本 \(AppMetadata.version)（构建 \(AppMetadata.build)）")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 6)
+
+            Divider()
+                .padding(.horizontal, 30)
+                .padding(.vertical, 16)
+
+            VStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("作者")
+                        .foregroundStyle(.secondary)
+                    Text(AppMetadata.authorName)
+                        .textSelection(.enabled)
+                }
+
+                HStack(spacing: 6) {
+                    Text("仓库")
+                        .foregroundStyle(.secondary)
+                    if let repositoryURL = AppMetadata.repositoryURL {
+                        Link(AppMetadata.repositoryName, destination: repositoryURL)
+                    } else {
+                        Text(AppMetadata.repositoryName)
+                    }
+                }
+            }
+            .font(.system(size: 12))
+
+            HStack(spacing: 10) {
+                Button(didCopy ? "已复制" : "复制仓库地址") {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(AppMetadata.repositoryURLString, forType: .string)
+                    didCopy = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        didCopy = false
+                    }
+                }
+
+                Button("在 GitHub 上查看") {
+                    if let repositoryURL = AppMetadata.repositoryURL {
+                        NSWorkspace.shared.open(repositoryURL)
+                    }
+                }
+
+                Button("好") {
+                    onClose()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 20)
+            .padding(.bottom, 24)
+        }
+        .frame(width: 360)
+    }
+}
+
+/// 「关于」窗口的创建与复用
+@MainActor
+enum AboutWindow {
+    private static var panel: NSWindow?
+
+    static func show() {
+        if panel == nil {
+            let hosting = NSHostingController(rootView: AboutView(
+                icon: NSApp.applicationIconImage ?? NSImage(),
+                onClose: { panel?.close() }
+            ))
+            let newPanel = NSWindow(contentViewController: hosting)
+            newPanel.title = "关于 \(AppMetadata.displayName)"
+            newPanel.styleMask = [.titled, .closable]
+            newPanel.isReleasedWhenClosed = false
+            newPanel.center()
+            panel = newPanel
+        }
+        panel?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 @main
 struct SimplePDFReaderApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -990,6 +1118,13 @@ struct SimplePDFReaderApp: App {
                 }
         }
         .commands {
+            // 用自定义「关于」面板替换系统默认的 About 项，展示作者与仓库信息
+            CommandGroup(replacing: .appInfo) {
+                Button("关于 \(AppMetadata.displayName)") {
+                    AboutWindow.show()
+                }
+            }
+
             // 在左上角应用主菜单 (SimplePDFReader) 中加入“设为默认 PDF 阅读器…”
             CommandGroup(after: .appInfo) {
                 Divider()

@@ -87,6 +87,8 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <string>__APP_VERSION__</string>
     <key>CFBundleVersion</key>
     <string>__APP_BUILD__</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 xitihangto · github.com/xitihangto/SimplePDFReader</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
