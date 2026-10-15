@@ -7,31 +7,79 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release 版本号 (例如 v1.0.0)'
+        description: 'Release 版本号（必填，必须以 v 开头，例如 v1.0.1）'
         required: true
-        default: 'v1.0.0'
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
+    # 本项目仅支持 Apple Silicon（arm64），macos-14 运行器即 arm64
     runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Resolve version
+        id: version
+        run: |
+          # tag 触发时取 tag 名；手动触发时取输入值。
+          # 注意：手动触发必须显式填写版本号，这里不设默认值，
+          # 避免误改到已存在的 Release。
+          TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
+
+          if [ -z "$TAG" ]; then
+            echo "错误：未能解析出版本号。" >&2
+            exit 1
+          fi
+
+          case "$TAG" in
+            v*) ;;
+            *) echo "错误：版本号必须以 v 开头（例如 v1.0.1），当前为 '$TAG'。" >&2; exit 1 ;;
+          esac
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "解析出版本号：$TAG"
+
       - name: Build SimplePDFReader.app
         run: |
           chmod +x ./build_app.sh
-          OUTPUT_APP_PATH="$RUNNER_TEMP/SimplePDFReader.app" ./build_app.sh
-          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/SimplePDFReader.app" "$RUNNER_TEMP/SimplePDFReader-macOS-arm64.zip"
+          OUTPUT_APP_PATH="$RUNNER_TEMP/SimplePDFReader.app" \
+          APP_VERSION="${{ steps.version.outputs.tag }}" \
+            ./build_app.sh
+
+      - name: Verify signature and bundled version
+        run: |
+          APP="$RUNNER_TEMP/SimplePDFReader.app"
+
+          # 1) 签名必须真实有效。历史上曾因 bundle 携带 ResourceFork/FinderInfo
+          #    导致 codesign 静默失败，产出仅带链接器临时签名的无效产物。
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "签名校验通过"
+
+          # 2) Info.plist 中的版本号必须与 tag 一致，防止版本号漂移
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          EXPECTED="${{ steps.version.outputs.tag }}"
+          EXPECTED="${EXPECTED#v}"
+          echo "产物版本：$PLIST_VERSION / 期望版本：$EXPECTED"
+          if [ "$PLIST_VERSION" != "$EXPECTED" ]; then
+            echo "错误：产物版本号与 tag 不一致。" >&2
+            exit 1
+          fi
+
+      - name: Package app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/SimplePDFReader.app" \
+            "$RUNNER_TEMP/SimplePDFReader-macOS-arm64.zip"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          name: SimplePDFReader ${{ github.event.inputs.tag_name || github.ref_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: SimplePDFReader ${{ steps.version.outputs.tag }}
           body_path: CHANGELOG.md
           files: ${{ runner.temp }}/SimplePDFReader-macOS-arm64.zip
           draft: false

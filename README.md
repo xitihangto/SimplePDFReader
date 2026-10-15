@@ -79,9 +79,15 @@ chmod +x build_app.sh
 mv ../SimplePDFReader.app /Applications/
 ```
 
-脚本会自动完成：用 CoreGraphics 渲染 `1024×1024` 高清图标并封装 `AppIcon.icns` → 编译 Swift 源码 → 清除扩展属性 → 执行本地（ad-hoc）签名并校验，最后在**仓库的上级目录**生成 `SimplePDFReader.app`。
+脚本会自动完成：用 CoreGraphics 渲染 `1024×1024` 高清图标并封装 `AppIcon.icns` → 编译 Swift 源码 → 注入版本号 → 清除扩展属性 → 执行本地（ad-hoc）签名并校验，最后在**仓库的上级目录**生成 `SimplePDFReader.app`。
 
-终端输出 `构建完成（已本地签名并通过校验）` 即为成功。
+终端输出 `构建完成（版本 x.y.z，已本地签名并通过校验）` 即为成功。
+
+**版本号**默认自动读取仓库最近的 git tag；也可以手动指定：
+
+```bash
+APP_VERSION=1.2.3 ./build_app.sh
+```
 
 #### 环境要求
 
@@ -111,13 +117,15 @@ git push --tags
 
 推送 tag 后，[`.github/workflows/release.yml`](.github/workflows/release.yml) 会自动：
 
-1. 在 `macos-14` 运行器上执行 `./build_app.sh`，**从源码**编译出 `SimplePDFReader.app`；
-2. 打包为 `SimplePDFReader-macOS-arm64.zip`；
-3. 以 `CHANGELOG.md` 作为正文创建同名 Release，并附上该产物。
+1. 解析 tag 作为版本号，并通过 `APP_VERSION` 注入到 App 的 `Info.plist`；
+2. 在 `macos-14`（Apple Silicon）运行器上执行 `./build_app.sh`，**从源码**编译出 `SimplePDFReader.app`；
+3. **校验代码签名有效，且 `Info.plist` 中的版本号与 tag 一致**——任一不通过则构建直接失败，不会产出 Release；
+4. 打包为 `SimplePDFReader-macOS-arm64.zip`；
+5. 以 `CHANGELOG.md` 作为正文创建同名 Release，并附上该产物。
 
 ### 手动重跑
 
-进入 **Actions → Build and Release macOS App → Run workflow**，填入要发布的版本号（例如 `v1.0.1`）即可手动触发一次构建发布。
+进入 **Actions → Build and Release macOS App → Run workflow**，填入要发布的版本号（例如 `v1.0.1`）即可手动触发一次构建发布。该输入为**必填**且必须以 `v` 开头，**没有默认值**——避免手滑把已发布的 Release 改掉。
 
 ### 约定
 

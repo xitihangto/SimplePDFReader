@@ -20,7 +20,9 @@ MSG
   exit 1
 fi
 
-if ! command -v swiftc >/dev/null 2>&1 || ! xcrun --show-sdk-path >/dev/null 2>&1; then
+if ! command -v swift >/dev/null 2>&1 \
+   || ! command -v swiftc >/dev/null 2>&1 \
+   || ! xcrun --show-sdk-path >/dev/null 2>&1; then
   cat >&2 <<'MSG'
 错误：Swift 工具链不可用，无法编译。
 
@@ -33,8 +35,27 @@ MSG
   exit 1
 fi
 
+# ---------- 版本号解析 ----------
+# 优先级：APP_VERSION 环境变量 > 仓库最近的 git tag > 回退 1.0.0
+# CI 发版时通过 APP_VERSION 传入 tag（如 v1.0.1）；本机构建则自动读取最近的 tag。
+# 可用 APP_VERSION=1.2.3 ./build_app.sh 手动指定。
+VERSION_RAW="${APP_VERSION:-}"
+if [ -z "$VERSION_RAW" ]; then
+  VERSION_RAW="$(git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
+fi
+[ -n "$VERSION_RAW" ] || VERSION_RAW="1.0.0"
+
+# 去掉前缀 v，得到形如 1.0.1 的版本号
+VERSION="${VERSION_RAW#v}"
+[ -n "$VERSION" ] || VERSION="1.0.0"
+
+# CFBundleVersion 只允许数字与点号，这里做一次净化（如 1.0.1-beta -> 1.0.1）
+BUILD="$(printf '%s' "$VERSION" | sed 's/[^0-9.].*$//')"
+[ -n "$BUILD" ] || BUILD="1"
+
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
+echo "0. 构建版本：$VERSION (CFBundleVersion=$BUILD)"
 echo "1. 正在生成红色系高清应用图标 (1024x1024)..."
 swift "$SCRIPT_DIR/generate_icon.swift" "$ICON_PNG" "$ICON_ICNS"
 cp "$ICON_ICNS" "$RESOURCES_DIR/AppIcon.icns"
@@ -63,9 +84,9 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>__APP_VERSION__</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>__APP_BUILD__</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -92,6 +113,21 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
 </dict>
 </plist>
 EOF
+
+# 用占位符 + 替换的方式注入版本号：上面的 heredoc 用引号包裹（<<'EOF'），
+# 不会展开变量，因此可以安全地先把 plist 原样写出，再定点替换版本字段。
+# 注意：这里刻意不用 `sed -i`——BSD sed 与 GNU sed 对 -i 的参数处理不同
+# （BSD 要求 `-i ''`，GNU 要求 `-i`），改用「重定向到临时文件再覆盖」的写法，
+# 两种实现下行为一致。
+PLIST_TMP="$(mktemp)"
+sed "s/__APP_VERSION__/${VERSION}/g; s/__APP_BUILD__/${BUILD}/g" \
+    "$CONTENTS_DIR/Info.plist" > "$PLIST_TMP"
+mv "$PLIST_TMP" "$CONTENTS_DIR/Info.plist"
+
+if grep -q '__APP_VERSION__\|__APP_BUILD__' "$CONTENTS_DIR/Info.plist"; then
+  echo "错误：Info.plist 中的版本号占位符未被替换。" >&2
+  exit 1
+fi
 
 echo "2. 正在编译 SimplePDFReader..."
 swiftc -O -parse-as-library \
@@ -124,4 +160,4 @@ fi
 
 touch "$APP_BUNDLE"
 
-echo "构建完成（已本地签名并通过校验）：$APP_BUNDLE"
+echo "构建完成（版本 $VERSION，已本地签名并通过校验）：$APP_BUNDLE"
