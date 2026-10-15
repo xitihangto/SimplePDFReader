@@ -39,7 +39,8 @@
 
 ### 方式一：直接下载 Release 应用包
 
-1. 前往仓库右侧 **Releases** 页面下载最新的 `SimplePDFReader-macOS.zip` 并解压。
+1. 前往仓库右侧 **Releases** 页面下载最新的 `SimplePDFReader-macOS-arm64.zip` 并解压。
+   > **架构说明**：该产物由 GitHub Actions 在 `macos-14`（Apple Silicon）运行器上构建，**仅支持 Apple Silicon（arm64）机型**。Intel Mac 请改用下方的「方式二」从源码编译。
 2. 将解压出的 `SimplePDFReader.app` 拖入 `/Applications`（应用程序）目录或任意位置双击运行。
 3. **首次打开安全提示说明**：由于应用采用开源本地签名，从网络下载后若遇到 macOS 提示“无法验证开发者”，可通过以下任一方式放行：
    - **系统设置放行**：打开「系统设置 → 隐私与安全性」，滑至底部点击 **「仍要打开」**。
@@ -59,6 +60,35 @@
   ./build_app.sh
   ```
   脚本会自动使用 CoreGraphics 渲染 `1024×1024` 红色系高清图标、封装多分辨率 `AppIcon.icns`，并在上级目录生成可直接双击运行的 `SimplePDFReader.app`。
+
+## 发版流程（维护者）
+
+本项目对外发布的 Release 产物**只允许由 GitHub Actions 构建产生**，以保证任何一个下载到的 `.app` 都能溯源到具体的源码提交，杜绝「来源不明的二进制包」。
+
+### 标准发版步骤
+
+```bash
+# 1. 先在 CHANGELOG.md 中新增对应版本的更新段落
+# 2. 打 tag 并推送（tag 必须匹配 v* 格式）
+git tag v1.0.1
+git push --tags
+```
+
+推送 tag 后，[`.github/workflows/release.yml`](.github/workflows/release.yml) 会自动：
+
+1. 在 `macos-14` 运行器上执行 `./build_app.sh`，**从源码**编译出 `SimplePDFReader.app`；
+2. 打包为 `SimplePDFReader-macOS-arm64.zip`；
+3. 以 `CHANGELOG.md` 作为正文创建同名 Release，并附上该产物。
+
+### 手动重跑
+
+进入 **Actions → Build and Release macOS App → Run workflow**，填入要发布的版本号（例如 `v1.0.1`）即可手动触发一次构建发布。
+
+### 约定
+
+- **禁止**手工上传本地打包的 zip 作为 Release 附件。本地产物无法自证由仓库源码构建，会破坏产物的可溯源性。
+- Release 附件的上传者（uploader）应始终为 `github-actions[bot]`，可据此校验产物真伪。
+- 发版前请确认 CI 构建通过；构建失败时不要手工补传产物，应先修复源码或工作流。
 
 ## 项目结构
 
