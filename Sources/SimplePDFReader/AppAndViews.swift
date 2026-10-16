@@ -91,14 +91,16 @@ struct PDFKitRepresentedView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> InteractivePDFView {
         let pdfView = InteractivePDFView()
-        pdfView.autoScales = false
-        pdfView.scaleFactor = pane.scaleFactor
-        pdfView.displayMode = pane.displayMode
+        // 顺序很重要：先把 min/max 与 displayMode 定好，再给文档，最后设缩放。
+        // 否则 PDFKit 会在设置文档/改动画模式时按自己的规则「取整」当前比例，
+        // 表现为「切一次分屏，缩放比例自己变了一点」。
         pdfView.displayDirection = .vertical
         pdfView.displaysPageBreaks = true
         pdfView.backgroundColor = NSColor.windowBackgroundColor
-        pdfView.minScaleFactor = 0.25
-        pdfView.maxScaleFactor = 5.0
+        pdfView.minScaleFactor = PDFReaderViewModel.minZoomScale
+        pdfView.maxScaleFactor = PDFReaderViewModel.maxZoomScale
+        pdfView.autoScales = false
+        pdfView.displayMode = pane.displayMode
 
         let activeIndex = paneIndex
         pdfView.onActivatePane = { [weak viewModel] in
@@ -119,18 +121,11 @@ struct PDFKitRepresentedView: NSViewRepresentable {
             }
         }
 
-        if let doc = pane.activeDocument(fallback: viewModel.primaryDocument) {
-            pdfView.document = doc
-            pdfView.autoScales = false
-            pdfView.scaleFactor = pane.scaleFactor
-            let targetIdx = min(max(pane.currentPageNumber - 1, 0), max(doc.pageCount - 1, 0))
-            if let page = doc.page(at: targetIdx) {
-                pdfView.go(to: page)
-            }
-        }
-
+        // 关键：先把视图登记到 PaneState，再同步状态。
+        // 这样即便同步过程中触发了回调，操作也已经指向正确的视图。
         pane.pdfView = pdfView
         context.coordinator.observe(pdfView: pdfView)
+        applyModelState(to: pdfView, forcePage: true)
 
         DispatchQueue.main.async {
             viewModel.syncActivePaneMetrics()
@@ -142,23 +137,57 @@ struct PDFKitRepresentedView: NSViewRepresentable {
         if pane.pdfView !== pdfView {
             pane.pdfView = pdfView
         }
-        let targetDoc = pane.activeDocument(fallback: viewModel.primaryDocument)
-        if pdfView.document !== targetDoc {
-            pdfView.document = targetDoc
-            pdfView.autoScales = false
-            pdfView.scaleFactor = pane.scaleFactor
-            if let doc = targetDoc {
-                let targetIdx = min(max(pane.currentPageNumber - 1, 0), max(doc.pageCount - 1, 0))
-                if let page = doc.page(at: targetIdx) {
-                    pdfView.go(to: page)
-                }
-            }
+        let documentChanged = pdfView.document !== pane.activeDocument(fallback: viewModel.primaryDocument)
+        applyModelState(to: pdfView, forcePage: documentChanged)
+        if pdfView.displayMode != pane.displayMode {
+            pdfView.displayMode = pane.displayMode
+        }
+        if documentChanged {
             DispatchQueue.main.async {
                 viewModel.syncActivePaneMetrics()
             }
         }
-        if pdfView.displayMode != pane.displayMode {
-            pdfView.displayMode = pane.displayMode
+    }
+
+    /// SwiftUI 移除该视图时调用：只有当登记的仍是本视图时才清空，
+    /// 避免「新视图已登记、旧视图随后被销毁」时把新引用误清掉。
+    static func dismantleNSView(_ pdfView: InteractivePDFView, coordinator: Coordinator) {
+        if coordinator.pane.pdfView === pdfView {
+            coordinator.pane.pdfView = nil
+        }
+    }
+
+    /// 把模型状态（文档 / 缩放 / 页码）同步到视图。
+    ///
+    /// 设计原则：**模型是唯一权威，视图只负责跟随**。这样无论 SwiftUI 何时重建视图
+    /// （切换分屏、开关侧栏、窗口缩放都可能触发），状态都会自动纠正回来，
+    /// 不会出现「操作无效」。
+    private func applyModelState(to pdfView: InteractivePDFView, forcePage: Bool) {
+        let targetDoc = pane.activeDocument(fallback: viewModel.primaryDocument)
+        if pdfView.document !== targetDoc {
+            pdfView.document = targetDoc
+        }
+        pdfView.autoScales = false
+
+        // 缩放：以模型为准。程序化设置期间抑制 PDFKit 的回声，
+        // 否则它会把「自己取整后的值」写回模型，造成比例漂移。
+        if abs(pdfView.scaleFactor - pane.scaleFactor) > 0.005 {
+            pane.isApplyingProgrammaticScale = true
+            pdfView.scaleFactor = pane.scaleFactor
+            let target = pane
+            DispatchQueue.main.async { target.isApplyingProgrammaticScale = false }
+        }
+
+        // 页码：仅在「视图新建」或「换了文档」时强制对齐。
+        // 不能每次更新都对齐 —— 用户滚动引起的页码变化是异步回写模型的，
+        // 每次都强制对齐会把用户的滚动「拽回去」。
+        guard forcePage, let doc = targetDoc, doc.pageCount > 0 else { return }
+        let targetIdx = min(max(pane.currentPageNumber - 1, 0), max(doc.pageCount - 1, 0))
+        if let currentPage = pdfView.currentPage, doc.index(for: currentPage) == targetIdx {
+            return
+        }
+        if let page = doc.page(at: targetIdx) {
+            pdfView.go(to: page)
         }
     }
 
@@ -972,6 +1001,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 应用已在运行时被再次激活（点 Dock 图标、Finder 里再双击图标、或「用本应用打开文件」）。
+    /// 明确返回 false 表示「由我们自己处理，不要走默认行为」——
+    /// SwiftUI 的默认行为是在这类事件中新建窗口，正是历史上「莫名其妙多出一个窗口」的来源。
+    /// 这里统一改为：把已有窗口提到最前，绝不新建。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // 只在「主窗口」上做处理：排除「关于」面板，也排除 AppKit/SwiftUI 内部的
+        // 隐藏辅助窗口（输入法候选窗、提示气泡等）。
+        let mainWindow = sender.windows.first {
+            $0 !== AboutWindow.panel && ($0.isVisible || $0.isMiniaturized)
+        }
+        if let window = mainWindow {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+        }
+        sender.activate(ignoringOtherApps: false)
+        return false
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
@@ -1085,7 +1132,7 @@ private struct AboutView: View {
 /// 「关于」窗口的创建与复用
 @MainActor
 enum AboutWindow {
-    private static var panel: NSWindow?
+    private(set) static var panel: NSWindow?
 
     static func show() {
         if panel == nil {
@@ -1110,9 +1157,28 @@ struct SimplePDFReaderApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var viewModel = PDFReaderViewModel()
 
+    /// 窗口标题：随打开的文档变化。刻意不再把它作为 Scene 的标题参数传入 ——
+    /// 场景标题应当保持稳定，动态内容交给 navigationTitle 更可靠。
+    private var windowTitle: String {
+        viewModel.primaryDocument == nil
+            ? AppMetadata.displayName
+            : "\(AppMetadata.displayName) — \(viewModel.primaryFileName)"
+    }
+
     var body: some Scene {
-        WindowGroup(viewModel.primaryDocument == nil ? "SimplePDFReader" : "SimplePDFReader — \(viewModel.primaryFileName)") {
+        // 必须是 Window 而不是 WindowGroup。
+        //
+        // WindowGroup 允许同一份 App 存在多个窗口，而本 App 只有一份 viewModel、
+        // 每个分屏只持有一个 PDFView 引用。一旦出现第二个窗口，两个窗口会争抢同一个
+        // pane.pdfView，导致操作（缩放、跳页）只作用到其中一个窗口，另一个窗口表现为
+        // 「放大缩小完全无效」「点页码不跳转」。
+        //
+        // 触发第二个窗口的真实路径：应用已在运行时，从 Finder 双击 PDF（或任何
+        // 「用本应用打开文件」的动作）—— SwiftUI 的 WindowGroup 会据此新建窗口。
+        // 换成 Window 后，窗口实例全局唯一，从结构上杜绝该问题。
+        Window(AppMetadata.displayName, id: "main") {
             ContentView(viewModel: viewModel)
+                .navigationTitle(windowTitle)
                 .onAppear {
                     appDelegate.viewModel = viewModel
                 }

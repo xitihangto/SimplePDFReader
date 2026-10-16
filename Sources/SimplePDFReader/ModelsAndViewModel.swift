@@ -118,7 +118,25 @@ final class PaneState: ObservableObject, Identifiable {
     @Published var scaleFactor: CGFloat = 1.0
     @Published var displayMode: PDFDisplayMode = .singlePageContinuous
 
-    weak var pdfView: PDFView?
+    /// 当前分屏对应的 PDFView。
+    ///
+    /// 这里刻意使用**强引用**：早期版本用的是 weak，一旦 SwiftUI 因视图结构变化
+    /// 重建/释放了 NSView，该引用会静默变成 nil，于是缩放、跳页等操作全部无声失效，
+    /// 而界面上的百分比却照常变化（因为模型被改了），表现为「操作完全无效」。
+    /// 生命周期由 NSViewRepresentable 负责：makeNSView / updateNSView 赋值，
+    /// dismantleNSView 置空。
+    var pdfView: PDFView?
+
+    /// 仅当 PDFView 确实挂在某个窗口上时才算「可操作」。
+    /// 用来挡住「引用还在、但视图已脱离窗口层级」的僵尸对象。
+    var livePDFView: PDFView? {
+        guard let view = pdfView, view.window != nil else { return nil }
+        return view
+    }
+
+    /// 程序化设置缩放期间置位，用于抑制 PDFKit 回调回声，
+    /// 保证 pane.scaleFactor（模型）始终是权威值。
+    var isApplyingProgrammaticScale = false
 
     init(id: Int) {
         self.id = id
@@ -173,7 +191,7 @@ final class PDFReaderViewModel: ObservableObject {
     @Published var smartZoomStrategy: SmartZoomStrategy = .adaptivePanesAndColumns {
         didSet {
             if layoutMode == .autoByZoom {
-                let scale = activePane.pdfView?.scaleFactor ?? activePane.scaleFactor
+                let scale = activePane.livePDFView?.scaleFactor ?? activePane.scaleFactor
                 applySmartZoomLayout(forScale: scale, force: true)
             }
         }
@@ -223,9 +241,10 @@ final class PDFReaderViewModel: ObservableObject {
     /// 同步当前激活分屏的缩放百分比、当前页码与总页数到顶层属性
     func syncActivePaneMetrics() {
         let pane = activePane
-        if let liveScale = pane.pdfView?.scaleFactor, liveScale > 0 {
-            pane.scaleFactor = liveScale
-        }
+        // 刻意不在这里从视图回读 scaleFactor：模型是唯一权威来源。
+        // 视图侧的缩放变化会经 PDFViewScaleChanged / scaleFactor didSet 进入
+        // handleScaleChanged，不需要（也不应该）在这里覆盖模型，
+        // 否则 PDFKit 的内部取整会污染模型，造成比例漂移。
         let pct = max(10, min(1000, Int(round(pane.scaleFactor * 100))))
         if activeScalePercentage != pct {
             activeScalePercentage = pct
@@ -319,9 +338,9 @@ final class PDFReaderViewModel: ObservableObject {
             pane.currentPageNumber = 1
             pane.pageInputText = "1"
             pane.scaleFactor = 1.0
-            pane.pdfView?.document = doc
-            pane.pdfView?.autoScales = false
-            pane.pdfView?.scaleFactor = 1.0
+            pane.livePDFView?.document = doc
+            pane.livePDFView?.autoScales = false
+            pane.livePDFView?.scaleFactor = 1.0
             activePaneIndex = targetPaneIdx
             syncActivePaneMetrics()
             if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -342,23 +361,23 @@ final class PDFReaderViewModel: ObservableObject {
         // 更新所有未绑定独立文档的分屏，默认以 100% (scaleFactor = 1.0) 清晰展示并支持平滑加减缩放
         for (idx, pane) in panes.enumerated() {
             if pane.customDocument == nil {
-                pane.pdfView?.document = doc
+                pane.livePDFView?.document = doc
                 let initialPageIdx = min(idx, max(doc.pageCount - 1, 0))
                 if let page = doc.page(at: initialPageIdx) {
-                    pane.pdfView?.go(to: page)
+                    pane.livePDFView?.go(to: page)
                 }
                 pane.currentPageNumber = initialPageIdx + 1
                 pane.pageInputText = "\(initialPageIdx + 1)"
                 pane.scaleFactor = 1.0
-                pane.pdfView?.autoScales = false
-                pane.pdfView?.scaleFactor = 1.0
+                pane.livePDFView?.autoScales = false
+                pane.livePDFView?.scaleFactor = 1.0
             }
         }
 
         syncActivePaneMetrics()
 
         if layoutMode == .autoByZoom {
-            let currentScale = activePane.pdfView?.scaleFactor ?? 1.0
+            let currentScale = activePane.livePDFView?.scaleFactor ?? 1.0
             applySmartZoomLayout(forScale: currentScale, force: true)
         }
     }
@@ -368,11 +387,11 @@ final class PDFReaderViewModel: ObservableObject {
         let pane = panes[paneIndex]
         pane.customDocument = nil
         pane.customFileName = nil
-        pane.pdfView?.document = primaryDocument
+        pane.livePDFView?.document = primaryDocument
         if let doc = primaryDocument {
             let pageIdx = min(max(panes[0].currentPageNumber - 1 + paneIndex, 0), max(doc.pageCount - 1, 0))
             if let page = doc.page(at: pageIdx) {
-                pane.pdfView?.go(to: page)
+                pane.livePDFView?.go(to: page)
             }
             pane.currentPageNumber = pageIdx + 1
             pane.pageInputText = "\(pageIdx + 1)"
@@ -381,20 +400,31 @@ final class PDFReaderViewModel: ObservableObject {
     }
 
     // MARK: - 缩放控制 (放大 / 缩小 / 自适应宽度 / 实际大小)
+    /// PDFView 允许的缩放区间，与 PDFKitRepresentedView 中设置的 min/max 保持一致
+    static let minZoomScale: CGFloat = 0.25
+    static let maxZoomScale: CGFloat = 5.0
+
     func zoomIn() {
-        let pane = activePane
-        let current = pane.pdfView?.scaleFactor ?? pane.scaleFactor
-        let stepped = round((current + 0.15) * 20) / 20
-        let newScale = min(max(stepped, current * 1.12), 5.0)
-        applyZoomScale(newScale, toPaneIndex: activePaneIndex)
+        stepZoom(by: 1.15)
     }
 
     func zoomOut() {
+        stepZoom(by: 1 / 1.15)
+    }
+
+    /// 统一的步进缩放：读取**当前真正可见**视图的比例作为基准，
+    /// 避免读到已脱钩视图（或模型与视图不一致）导致的「点了没反应」。
+    private func stepZoom(by factor: CGFloat) {
         let pane = activePane
-        let current = pane.pdfView?.scaleFactor ?? pane.scaleFactor
-        let stepped = round((current - 0.15) * 20) / 20
-        let newScale = max(min(stepped, current / 1.12), 0.25)
-        applyZoomScale(newScale, toPaneIndex: activePaneIndex)
+        let current = pane.livePDFView?.scaleFactor ?? pane.scaleFactor
+        guard current > 0 else { return }
+        let stepped = factor > 1
+            ? round((current + 0.15) * 20) / 20
+            : round((current - 0.15) * 20) / 20
+        let target = factor > 1
+            ? min(max(stepped, current * 1.12), Self.maxZoomScale)
+            : max(min(stepped, current / 1.12), Self.minZoomScale)
+        applyZoomScale(target, toPaneIndex: activePaneIndex)
     }
 
     func resetZoomToActualSize() {
@@ -403,31 +433,48 @@ final class PDFReaderViewModel: ObservableObject {
 
     func zoomToFit() {
         let pane = activePane
-        guard let pdfView = pane.pdfView else { return }
+        guard let pdfView = pane.livePDFView else {
+            // 视图尚未就绪时不要静默失败：至少把模型对齐到 100%，
+            // 视图创建时（makeNSView）会按模型重新应用。
+            applyZoomScale(1.0, toPaneIndex: activePaneIndex)
+            return
+        }
         pdfView.autoScales = true
         pdfView.layoutDocumentView()
         let fittedScale = pdfView.scaleFactor > 0 ? pdfView.scaleFactor : 1.0
         pdfView.autoScales = false
-        pdfView.scaleFactor = fittedScale
-        handleScaleChanged(paneIndex: activePaneIndex, scale: fittedScale)
+        applyZoomScale(fittedScale, toPaneIndex: activePaneIndex)
     }
 
     func applyZoomScale(_ newScale: CGFloat, toPaneIndex paneIndex: Int) {
-        guard paneIndex >= 0 && paneIndex < panes.count else { return }
+        guard paneIndex >= 0 && paneIndex < panes.count, newScale > 0 else { return }
+        let clamped = min(max(newScale, Self.minZoomScale), Self.maxZoomScale)
         let pane = panes[paneIndex]
-        pane.scaleFactor = newScale
-        if let pdfView = pane.pdfView {
+
+        // 1) 模型先行：即使此刻视图不可用，状态也是正确的，
+        //    后续 makeNSView / updateNSView 会据此把视图纠正回来。
+        pane.scaleFactor = clamped
+
+        // 2) 再作用于当前真正可见的视图
+        if let pdfView = pane.livePDFView {
+            pane.isApplyingProgrammaticScale = true
             pdfView.autoScales = false
-            pdfView.scaleFactor = newScale
+            pdfView.scaleFactor = clamped
+            pdfView.layoutDocumentView()
+            let target = pane
+            DispatchQueue.main.async { target.isApplyingProgrammaticScale = false }
         }
-        handleScaleChanged(paneIndex: paneIndex, scale: newScale)
+
+        // 3) 顶栏百分比等派生状态必须立即跟上（这里不走 handleScaleChanged，
+        //    否则会被上面的抑制标志挡掉）
+        applyScaleMetrics(paneIndex: paneIndex, scale: clamped)
     }
 
     // MARK: - 分屏与智能缩放判断
     private func handleLayoutModeChanged() {
         switch layoutMode {
         case .autoByZoom:
-            let scale = activePane.pdfView?.scaleFactor ?? activePane.scaleFactor
+            let scale = activePane.livePDFView?.scaleFactor ?? activePane.scaleFactor
             applySmartZoomLayout(forScale: scale, force: true)
         case .single:
             setVisiblePanes(1)
@@ -459,7 +506,7 @@ final class PDFReaderViewModel: ObservableObject {
                     pane.pageInputText = "\(targetIdx + 1)"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                         if let page = doc.page(at: targetIdx) {
-                            pane.pdfView?.go(to: page)
+                            pane.livePDFView?.go(to: page)
                         }
                     }
                 }
@@ -471,8 +518,8 @@ final class PDFReaderViewModel: ObservableObject {
         isPerformingProgrammaticLayoutChange = true
         for pane in panes {
             pane.displayMode = mode
-            if pane.pdfView?.displayMode != mode {
-                pane.pdfView?.displayMode = mode
+            if pane.livePDFView?.displayMode != mode {
+                pane.livePDFView?.displayMode = mode
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -482,6 +529,22 @@ final class PDFReaderViewModel: ObservableObject {
 
     func handleScaleChanged(paneIndex: Int, scale: CGFloat) {
         guard paneIndex >= 0 && paneIndex < panes.count, scale > 0 else { return }
+        let pane = panes[paneIndex]
+
+        // 由本类自己程序化设置缩放时，PDFKit 会回吐一个被它内部「取整/夹取」过的值。
+        // 若照单全收，会出现「切一次分屏，缩放比例就自己变一点」的漂移。
+        // 因此程序化设置期间忽略回声，模型保持权威。
+        // 注意：本方法只用于处理「来自 PDFKit 的回声」，程序化设置请直接调用
+        // applyScaleMetrics，否则会把顶栏百分比一起挡掉。
+        if pane.isApplyingProgrammaticScale {
+            return
+        }
+
+        applyScaleMetrics(paneIndex: paneIndex, scale: scale)
+    }
+
+    /// 真正把缩放值落到模型与顶栏显示上
+    private func applyScaleMetrics(paneIndex: Int, scale: CGFloat) {
         panes[paneIndex].scaleFactor = scale
         if paneIndex == activePaneIndex {
             let pct = max(10, min(1000, Int(round(scale * 100))))
@@ -553,44 +616,75 @@ final class PDFReaderViewModel: ObservableObject {
     // MARK: - 页面跳转与同步
     func goToPreviousPage(inPane paneIndex: Int? = nil) {
         let idx = paneIndex ?? activePaneIndex
-        guard let pdfView = panes[idx].pdfView, pdfView.canGoToPreviousPage else { return }
+        guard let pdfView = panes[idx].livePDFView, pdfView.canGoToPreviousPage else { return }
         pdfView.goToPreviousPage(nil)
     }
 
     func goToNextPage(inPane paneIndex: Int? = nil) {
         let idx = paneIndex ?? activePaneIndex
-        guard let pdfView = panes[idx].pdfView, pdfView.canGoToNextPage else { return }
+        guard let pdfView = panes[idx].livePDFView, pdfView.canGoToNextPage else { return }
         pdfView.goToNextPage(nil)
     }
 
+    /// 跳转到指定页码。
+    /// 注意顺序：**先更新模型，再驱动视图** —— 这样即使此刻视图不可用（正在重建、
+    /// 或尚未挂到窗口上），页码状态也是正确的，视图就绪后会自行纠正到该页，
+    /// 不会出现「点了页码没反应」。
     func jumpToPage(number: Int, inPane paneIndex: Int? = nil) {
         let idx = paneIndex ?? activePaneIndex
+        guard idx >= 0 && idx < panes.count else { return }
         let pane = panes[idx]
         guard let doc = pane.activeDocument(fallback: primaryDocument),
               doc.pageCount > 0 else { return }
 
         let clampedPage = min(max(number, 1), doc.pageCount)
-        if let targetPage = doc.page(at: clampedPage - 1) {
-            pane.pdfView?.go(to: targetPage)
-            pane.currentPageNumber = clampedPage
-            pane.pageInputText = "\(clampedPage)"
-            if idx == activePaneIndex {
-                activePageNumber = clampedPage
-                activePageInputText = "\(clampedPage)"
-            }
+
+        pane.currentPageNumber = clampedPage
+        pane.pageInputText = "\(clampedPage)"
+        if idx == activePaneIndex {
+            activePageNumber = clampedPage
+            activePageInputText = "\(clampedPage)"
         }
+
+        guard let pdfView = pane.livePDFView,
+              let targetPage = doc.page(at: clampedPage - 1) else { return }
+        pdfView.go(to: targetPage)
     }
 
+    /// 点击大纲条目跳转。真实大纲与「无大纲时生成的快速页码」共用此逻辑。
     func jumpToOutline(_ node: OutlineNode) {
         let pane = activePane
-        guard let pdfView = pane.pdfView,
-              let doc = pane.activeDocument(fallback: primaryDocument) else { return }
+        guard let pdfView = pane.livePDFView,
+              let doc = pane.activeDocument(fallback: primaryDocument) else {
+            // 视图不可用：至少把页码模型对齐，视图就绪后自动跳到该页
+            if let pageNum = node.pageNumber {
+                jumpToPage(number: pageNum)
+            }
+            return
+        }
 
         if let destination = node.destination {
             pdfView.go(to: destination)
+            if let page = destination.page {
+                let idx = doc.index(for: page)
+                if idx != NSNotFound && idx >= 0 {
+                    pane.currentPageNumber = idx + 1
+                    pane.pageInputText = "\(idx + 1)"
+                    if pane.id == activePaneIndex {
+                        activePageNumber = idx + 1
+                        activePageInputText = "\(idx + 1)"
+                    }
+                }
+            }
         } else if let pageNum = node.pageNumber,
                   let page = doc.page(at: min(max(pageNum - 1, 0), doc.pageCount - 1)) {
             pdfView.go(to: page)
+            pane.currentPageNumber = pageNum
+            pane.pageInputText = "\(pageNum)"
+            if pane.id == activePaneIndex {
+                activePageNumber = pageNum
+                activePageInputText = "\(pageNum)"
+            }
         }
     }
 
@@ -615,7 +709,7 @@ final class PDFReaderViewModel: ObservableObject {
                     let targetPage = min(max(newPageNumber + idx, 1), doc.pageCount)
                     if otherPane.currentPageNumber != targetPage,
                        let pageObj = doc.page(at: targetPage - 1) {
-                        otherPane.pdfView?.go(to: pageObj)
+                        otherPane.livePDFView?.go(to: pageObj)
                     }
                 }
             }
@@ -691,7 +785,7 @@ final class PDFReaderViewModel: ObservableObject {
         // 不能直接赋空数组 []（PDFKit 中赋 [] 不会清除上一轮残留的高亮图层）
         for pane in panes {
             if pane.activeDocument(fallback: primaryDocument) === doc,
-               let pdfView = pane.pdfView {
+               let pdfView = pane.livePDFView {
                 clearPDFViewHighlights(pdfView)
                 if !selections.isEmpty {
                     pdfView.highlightedSelections = selections
@@ -732,7 +826,7 @@ final class PDFReaderViewModel: ObservableObject {
         guard index >= 0 && index < searchResults.count else { return }
         currentSearchIndex = index
         let item = searchResults[index]
-        guard let pdfView = activePane.pdfView else { return }
+        guard let pdfView = activePane.livePDFView else { return }
         pdfView.go(to: item.selection)
         pdfView.setCurrentSelection(item.selection, animate: animate)
     }
@@ -750,7 +844,7 @@ final class PDFReaderViewModel: ObservableObject {
         searchResults = []
         currentSearchIndex = -1
         for pane in panes {
-            if let pdfView = pane.pdfView {
+            if let pdfView = pane.livePDFView {
                 clearPDFViewHighlights(pdfView)
                 forceRedrawPDFView(pdfView)
             }
