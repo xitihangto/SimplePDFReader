@@ -1308,11 +1308,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // v1.8.0 改为**一个**自定义面板：左右并列两个问题框，各含两张选项卡
 // （不是按钮 —— 未选中时两张样式一致，选中后带一圈主题色描边），
 // 底部一个「我选好了，确认」按钮：两框都未选完前灰色禁用，选定后才可按。
-// 用户明确要求「无出口，必须选完两项」，因此面板是**无关闭按钮的 app 模态窗口**
-// （Esc 无效），除了确认按钮没有任何离开路径。
-// 「已问过」标记只在**确认后**写入 —— 中途强杀应用不算问过，下次启动重新问。
+// 用户明确要求「无出口，必须选完两项」，因此面板是 app 模态窗口。
+// v1.8.1 起改为两个出口：①确认按钮（应用两项选择）；②右上角系统标准
+// 关闭按钮（标题栏用 fullSizeContentView 融入内容，无细灰线）——
+// 点关闭 = 两项都不选、按程序默认值执行（不设为默认、多窗口模式），
+// 同样写「已问过」标记，以后不再弹出。
+// 「已问过」标记只在**做出选择后**写入（确认或关闭）—— 中途强杀应用不算问过，
+// 下次启动重新问。
 @MainActor
-final class FirstLaunchController: ObservableObject {
+final class FirstLaunchController: NSObject, ObservableObject, NSWindowDelegate {
     static let shared = FirstLaunchController()
 
     /// 「是否设为默认 PDF 阅读器」是否已经问过（整个面板算一问）。
@@ -1338,24 +1342,46 @@ final class FirstLaunchController: ObservableObject {
 
     private var modalWindow: NSWindow?
 
-    private init() {}
+    override private init() {}
 
     /// 弹出面板。调用方应确保窗口已可见；弹出后本方法会阻塞在模态会话里，
-    /// 直到用户点「我选好了，确认」（唯一出口）。
+    /// 直到用户点「我选好了，确认」或右上角关闭按钮（两个出口）。
     func present(on parent: NSWindow) {
         guard modalWindow == nil else { return }
 
         let hosting = NSHostingController(rootView: FirstLaunchView(controller: self))
         let window = NSWindow(contentViewController: hosting)
-        // 只要标题栏、不要任何按钮：没有关闭按钮，模态会话也不响应 Esc ——
-        // 「无出口」要求的正是这个。窗口可拖动、可 miniaturize 都不重要。
-        window.styleMask = [.titled]
+        // .titled + .closable：右上角保留系统标准关闭按钮（离上/右边缘自带少许内缩）。
+        // .fullSizeContentView + titlebarAppearsTransparent：标题栏融入内容，
+        // 顺手去掉标题栏与内容之间那条细灰线。
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
         window.title = ""
+        window.delegate = self
         window.center()
         modalWindow = window
         window.makeKeyAndOrderFront(nil)
 
         NSApp.runModal(for: window)
+    }
+
+    /// 用户点右上角关闭按钮：两项都不选，按程序默认值执行
+    /// （不设为默认 PDF 阅读器、窗口模式保持默认的多窗口模式），
+    /// 写「已问过」标记，以后不再弹出。
+    private func dismissWithDefaults() {
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedWindowModeKey)
+        modalWindow = nil
+        NSApp.stopModal()
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        // 用户主动关闭（右上角按钮）：按默认值收场。
+        // confirm() 走的是 orderOut 不是 close，不会触发这里。
+        guard modalWindow != nil else { return }
+        dismissWithDefaults()
     }
 
     /// 用户点「我选好了，确认」：静默应用两项选择、写标记、收面板。
@@ -1401,13 +1427,14 @@ struct FirstLaunchView: View {
                 questionPanel(title: "是否设为默认 PDF 阅读器？") {
                     optionCard(
                         title: "设为默认",
+                        badge: "推荐",
                         desc: "在 Finder 中双击 PDF 时用本应用打开",
                         selected: controller.defaultChoice == .setDefault
                     ) { controller.defaultChoice = .setDefault }
 
                     optionCard(
                         title: "以后再说",
-                        desc: "暂不更改，之后可在菜单中随时设置",
+                        desc: "暂不更改",
                         selected: controller.defaultChoice == .later
                     ) { controller.defaultChoice = .later }
                 }
@@ -1415,13 +1442,14 @@ struct FirstLaunchView: View {
                 questionPanel(title: "习惯使用哪种窗口模式？") {
                     optionCard(
                         title: "多窗口模式",
-                        desc: "可同时持有多个窗口实例，并排阅读不同文档",
+                        badge: "推荐",
+                        desc: "可同时持有多个窗口实例",
                         selected: controller.modeChoice == .multi
                     ) { controller.modeChoice = .multi }
 
                     optionCard(
                         title: "单窗口模式",
-                        desc: "全局仅保留一个窗口实例，打开只作用于该窗口",
+                        desc: "全局仅保留一个窗口实例",
                         selected: controller.modeChoice == .single
                     ) { controller.modeChoice = .single }
                 }
@@ -1445,7 +1473,9 @@ struct FirstLaunchView: View {
             .buttonStyle(.plain)
             .disabled(!controller.canConfirm)
         }
-        .padding(24)
+        // 标题栏已融入内容（fullSizeContentView），顶部多留一点，
+        // 避免与右上角关闭按钮竖向贴太近
+        .padding(EdgeInsets(top: 28, leading: 24, bottom: 24, trailing: 24))
         .frame(width: 560)
     }
 
@@ -1467,15 +1497,28 @@ struct FirstLaunchView: View {
 
     /// 选项卡：不是按钮，是一张圆角矩形卡片 —— 未选中时与同类项样式一致，
     /// 选中后多一圈主题色描边与浅色底纹。整张卡片可点。
+    /// `badge` 是标题旁的小徽章（如「推荐」）。
     private func optionCard(
         title: String,
+        badge: String? = nil,
         desc: String,
         selected: Bool,
         action: @escaping () -> Void
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: 13, weight: .medium))
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                if let badge {
+                    Text(badge)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color.accentColor))
+                }
+                Spacer(minLength: 0)
+            }
             Text(desc)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
