@@ -283,12 +283,64 @@ final class PDFReaderViewModel: ObservableObject {
     }
 
     // MARK: - 打开 PDF 文件
-    func openDocumentPanel(forPaneIndex paneIndex: Int? = nil) {
-        let title = paneIndex == nil
-            ? "选择要打开的 PDF 文件"
-            : "为分屏 #\((paneIndex ?? 0) + 1) 选择 PDF 文件"
+
+    /// 工具栏「打开」按钮 / 空状态按钮 / 菜单「打开 PDF…」：
+    /// 按「新窗口打开」的语义打开一份 PDF。
+    ///
+    /// 效果与在 Finder 里双击该 PDF 完全一致（都走 `ReaderWindowManager.openDocument`）：
+    ///   · 这份文件已经开着 → 聚焦那个窗口，不重复打开；
+    ///   · 本窗口正好是空的 → 就地填入；
+    ///   · 本窗口已有内容 → **新开一个窗口**，绝不顶掉当前正在看的东西。
+    func openDocumentPanel() {
+        guard let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") else { return }
+        let originWindow = WindowRegistry.shared.session(owning: self)?.window
+        ReaderWindowManager.shared.openDocument(at: url, preferring: originWindow)
+    }
+
+    /// 菜单「在当前窗口打开 PDF…」：明确替换**本窗口**当前文档，不开新窗口。
+    func openDocumentPanelReplacingCurrent() {
+        guard let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") else { return }
+        loadPDF(from: url)
+    }
+
+    /// 「换文件」按钮：为某个分屏单独打开一份对比 PDF（只影响该分屏）。
+    func openDocumentPanel(forPaneIndex paneIndex: Int) {
+        let title = "为分屏 #\(paneIndex + 1) 选择 PDF 文件"
         guard let url = PDFOpenPanel.choose(title: title) else { return }
         loadPDF(from: url, intoPane: paneIndex)
+    }
+
+    /// 关闭本窗口当前打开的文档，回到「刚启动、还没打开任何文件」的空白状态。
+    ///
+    /// 注意与窗口左上角的系统关闭按钮的区别：那个关的是**窗口**，这个只关掉**文档** ——
+    /// 窗口本身依然开着，只是回到了空状态。而且它只影响**本窗口**：其他窗口各自持有
+    /// 独立的 ViewModel，完全不受影响。
+    func closeDocument() {
+        guard primaryDocument != nil else { return }
+
+        // 各分屏单独打开的对比文档一并清掉，让窗口真正回到空白状态
+        for pane in panes {
+            pane.customDocument = nil
+            pane.customFileName = nil
+            pane.customFileURL = nil
+            pane.pdfView?.document = nil
+            pane.currentPageNumber = 1
+            pane.pageInputText = "1"
+            pane.scaleFactor = 1.0
+        }
+
+        primaryDocument = nil
+        primaryFileURL = nil
+        primaryFileName = "未打开文件"
+        outlineNodes = []
+
+        clearSearch()
+        activePaneIndex = 0
+        layoutMode = .single
+        syncActivePaneMetrics()
+
+        // 本窗口已不再引用任何文档，让共享缓存把没人用的条目回收掉
+        WindowRegistry.shared.sweepDocuments()
     }
 
     /// 加载 PDF。

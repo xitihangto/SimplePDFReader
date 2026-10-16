@@ -586,6 +586,12 @@ struct ContentView: View {
 
                 mainReadingArea
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // 内容区右上角的「关闭本文档」按钮（详见 closeDocumentButton）
+                    .overlay(alignment: .topTrailing) {
+                        if viewModel.primaryDocument != nil {
+                            closeDocumentButton
+                        }
+                    }
             }
         }
         .frame(minWidth: 400, minHeight: 360)
@@ -630,7 +636,7 @@ struct ContentView: View {
                             Image(systemName: "folder")
                         }
                     }
-                    .help("打开 PDF 文件 (⌘O)")
+                    .help("打开 PDF 文件 (⌘O) · 未打开则在新窗口打开，已打开则切到那个窗口")
                 }
                 .fixedSize()
 
@@ -886,6 +892,33 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - 内容区右上角「关闭本文档」按钮
+    //
+    // 与窗口左上角的系统关闭按钮（红点）不是一回事：
+    //   · 系统红点 → 关闭整个窗口（本窗口最后一个窗口时应用随之退出）；
+    //   · 本按钮   → 只关掉本窗口里打开的文档，窗口留着并回到空白状态，
+    //                随时可以再拖一份 PDF 进来；其他窗口完全不受影响。
+    private var closeDocumentButton: some View {
+        Button(action: { viewModel.closeDocument() }) {
+            Image(systemName: "xmark")
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundColor(.secondary)
+                .frame(width: 19, height: 19)
+                .background(
+                    Circle().fill(Color(NSColor.controlBackgroundColor).opacity(0.9))
+                )
+                .overlay(
+                    Circle().stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help("关闭本文档（不关闭窗口，也不影响其他窗口）⌥⌘W")
+        // 多屏模式下每个分屏顶部有一条状态栏，按钮要落在它下面，避免压住「换文件」等按钮
+        .padding(.top, viewModel.visiblePaneCount > 1 ? 34 : 8)
+        .padding(.trailing, 10)
+    }
+
     // MARK: - 主阅读区（支持 1 / 2 / 3 / 4 分屏与空状态）
     @ViewBuilder
     private var mainReadingArea: some View {
@@ -1105,10 +1138,14 @@ enum AboutWindow {
 //
 // 多窗口下的打开文件规则（本文件里最重要的一段逻辑）：
 //
-//   1. 「应用已在运行 + 双击 PDF」 → 新开一个窗口放这个文件。
+//   1. 「应用已在运行 + 双击 PDF」 → 该文件没开着就新开一个窗口放它；
+//      已经开着（含作为某个分屏的对比文档）则聚焦那个窗口，不重复打开。
 //   2. 「双击 PDF 启动应用」 → 文件放进应用启动时建出的那个空白窗口，
 //      而不是再开一个（否则每次双击都会多出一个空窗口）。
 //   3. 「点 Dock 图标重新激活」 → 只把已有窗口提到最前，绝不新建。
+//
+// 具体怎么分配交给 ReaderWindowManager.openDocument 统一决策，
+// 这样「双击 PDF」「拖到 Dock」「工具栏打开按钮」「菜单打开」四处行为完全一致。
 //
 // 第 2 条存在时序竞态：application(_:open:) 可能在第一个窗口出现之前就被调用。
 // 因此这里用「待打开队列 + 短时重试 + 窗口就绪回调」三重保险兜住它。
@@ -1194,18 +1231,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func drainPending() {
-        // 1) 优先塞进「已就绪但还没有文档」的窗口（应用刚启动时的空白窗口属于这一类）
-        while !pendingURLs.isEmpty, let session = WindowRegistry.shared.claimEmptySession() {
-            let url = pendingURLs.removeFirst()
-            session.viewModel.loadPDF(from: url, silently: true)
-            session.window?.makeKeyAndOrderFront(nil)
-        }
         guard !pendingURLs.isEmpty else {
             pendingRetries = 0
             return
         }
 
-        // 2) 一个窗口都还没出现（双击文件启动时的时序竞态）→ 稍等窗口出现
+        // 一个窗口都还没出现（「双击文件启动应用」时的时序竞态）→ 稍等它出现。
+        // 这一步必须等：否则这里先新开一个窗口，SwiftUI 稍后又建出主窗口，
+        // 用户就会看到两个窗口。
         if WindowRegistry.shared.isEmpty && pendingRetries < maxPendingRetries {
             pendingRetries += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -1214,12 +1247,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 3) 否则为每个文件新开一个窗口
+        // 交给统一的打开入口逐份处理。它会自己决定「填入空白窗口 / 聚焦已打开的窗口 /
+        // 新开窗口」，因此双击 PDF、拖到 Dock、命令行传参的行为完全一致。
         let urls = pendingURLs
         pendingURLs.removeAll()
         pendingRetries = 0
         for url in urls {
-            ReaderWindowManager.shared.open(fileURL: url)
+            ReaderWindowManager.shared.openDocument(at: url)
         }
     }
 
@@ -1358,23 +1392,33 @@ struct ReaderCommands: Commands {
 
         CommandGroup(replacing: .newItem) {
             Button("新建窗口") {
-                ReaderWindowManager.shared.open()
+                ReaderWindowManager.shared.openNewWindow()
             }
             .keyboardShortcut("n", modifiers: [.command])
 
-            Button("在新窗口打开 PDF…") {
-                if let url = PDFOpenPanel.choose(title: "选择要在新窗口中打开的 PDF") {
-                    ReaderWindowManager.shared.open(fileURL: url)
+            // 与「在 Finder 里双击 PDF」完全同一条路径：
+            // 没开着就新开窗口，已经开着就聚焦已有窗口，本窗口空着就地填入。
+            // 因此绝不会顶掉当前窗口正在看的内容。
+            Button("打开 PDF…") {
+                if let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") {
+                    ReaderWindowManager.shared.openDocument(at: url)
                 }
             }
-            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .keyboardShortcut("o", modifiers: [.command])
+
+            Button("在当前窗口打开 PDF…") {
+                reader?.openDocumentPanelReplacingCurrent()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .option])
 
             Divider()
 
-            Button("在当前窗口打开 PDF…") {
-                reader?.openDocumentPanel()
+            // 只关掉本窗口的文档（回到空白状态），窗口与其他窗口都不受影响。
+            // 想关窗口请用窗口左上角的系统按钮或 ⌘W。
+            Button("关闭本文档") {
+                reader?.closeDocument()
             }
-            .keyboardShortcut("o", modifiers: [.command])
+            .keyboardShortcut("w", modifiers: [.command, .option])
 
             Divider()
 

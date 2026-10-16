@@ -102,6 +102,14 @@ final class WindowRegistry {
         }
 
         var hasDocument: Bool { viewModel.primaryDocument != nil }
+
+        /// 本窗口是否正在显示指定文件。
+        /// 主文档与各分屏单独打开的对比文档都算 —— 一个文件只要在某个窗口里露着脸，
+        /// 就算「已经打开了」，再次打开时应当聚焦那个窗口而不是重复开一份。
+        func isDisplaying(_ key: URL) -> Bool {
+            if viewModel.primaryFileURL?.standardizedFileURL == key { return true }
+            return viewModel.panes.contains { $0.customFileURL?.standardizedFileURL == key }
+        }
     }
 
     static let shared = WindowRegistry()
@@ -163,6 +171,20 @@ final class WindowRegistry {
     /// 手动创建的窗口同样适用。
     var activeSession: Session? {
         session(for: NSApp.keyWindow)
+    }
+
+    /// 找到正在显示指定文件的窗口（多个时取最近活跃的那个）。
+    func session(displaying url: URL) -> Session? {
+        let key = url.standardizedFileURL
+        return liveSessions
+            .filter { $0.isDisplaying(key) }
+            .max { $0.lastActive < $1.lastActive }
+    }
+
+    /// 找到某个 ViewModel 所属的会话。
+    /// 供 ViewModel 反查「自己在哪个窗口里」——它不该直接持有窗口引用。
+    func session(owning viewModel: PDFReaderViewModel) -> Session? {
+        liveSessions.first { $0.viewModel === viewModel }
     }
 
     /// 取走一个「窗口已就绪、但还没有打开任何文档」的会话。
@@ -275,20 +297,52 @@ final class ReaderWindowManager {
 
     private init() {}
 
-    /// 打开一个阅读器窗口。
+    /// 新建一个阅读器窗口（菜单「文件 → 新建窗口」⌘N）。
     ///
-    /// - Parameter allowReuse: 是否允许复用「已就绪但还没有文档」的窗口。
-    ///   应用刚启动时那个空白窗口就属于这一类；把文件装进它，
-    ///   才能避免「双击文件启动后多出一个空窗口」。
-    func open(fileURL: URL? = nil, allowReuse: Bool = true) {
-        if allowReuse, let session = WindowRegistry.shared.claimEmptySession() {
-            if let url = fileURL {
-                session.viewModel.loadPDF(from: url, silently: true)
-            }
-            focus(session.window)
+    /// 用户明确要的是「一个新窗口」，所以即便此刻已经有一个空白窗口，也照样再开一个，
+    /// 不做复用 —— 复用会让 ⌘N 看起来「没反应」。
+    @discardableResult
+    func openNewWindow(fileURL: URL? = nil) -> UUID {
+        create(fileURL: fileURL)
+    }
+
+    /// 统一的「打开文件」入口 —— 双击 PDF、拖到 Dock、工具栏「打开」按钮、
+    /// 菜单「打开 PDF…」全部走这里，因此行为完全一致。
+    ///
+    /// 规则（按优先级）：
+    ///   1. 该文件已在某个窗口打开 → 聚焦那个窗口，**绝不重复打开同一份文件**；
+    ///   2. 发起操作的那个窗口本身是空的 → 就地填入（这是「填入」而不是「顶掉」，
+    ///      所以不会出现「点开一个文件，原来那个空窗口还空着」的浪费）；
+    ///   3. 还有别的空白窗口 → 装进最近用过的那个；
+    ///   4. 否则 → 新开一个窗口承载它。
+    ///
+    /// 关键在于第 4 条：**已经开着的内容永远不会被顶掉**，需要时自动多开一个窗口。
+    /// 这正是「多窗口对比阅读」的用法。
+    func openDocument(at url: URL, preferring window: NSWindow? = nil) {
+        let key = url.standardizedFileURL
+
+        // 1) 已经打开 → 聚焦，不重复打开
+        if let existing = WindowRegistry.shared.session(displaying: key) {
+            focus(existing.window)
             return
         }
-        create(fileURL: fileURL)
+
+        // 2) 发起操作的窗口是空的 → 就地填入
+        if let origin = WindowRegistry.shared.session(for: window), !origin.hasDocument {
+            origin.viewModel.loadPDF(from: key, silently: true)
+            focus(origin.window)
+            return
+        }
+
+        // 3) 任意一个空白窗口
+        if let empty = WindowRegistry.shared.claimEmptySession() {
+            empty.viewModel.loadPDF(from: key, silently: true)
+            focus(empty.window)
+            return
+        }
+
+        // 4) 新开一个窗口
+        create(fileURL: key)
     }
 
     /// 当前所有窗口正在查看的文件（用于退出时保存、下次启动恢复）
