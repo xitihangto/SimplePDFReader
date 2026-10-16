@@ -136,6 +136,14 @@ codesign --verify --verbose=2 /Applications/SimplePDFReader.app   # 应输出 va
 xattr /Applications/SimplePDFReader.app                           # 不应出现 com.apple.quarantine
 ```
 
+> **已装过旧版，想更新到最新版？** 推荐直接跑仓库自带的一键更新脚本（下载最新 CI 产物 → 校验签名 → 旧版移废纸篓 → 装进应用程序目录）：
+>
+> ```bash
+> ./update.sh          # 在仓库目录下执行；也可传具体版本，如 ./update.sh v1.5.0
+> ```
+>
+> 或者手动来：先 `rm -rf /Applications/SimplePDFReader.app` 移除旧版，再跑一次上面的安装命令。**不要直接覆盖安装** —— 那样新版会被塞进旧版目录里，出现嵌套。
+
 ### 方式三：从源码一键编译（零弹窗，需装 Xcode）
 
 > **为什么本机编译不会被 Gatekeeper 拦截？**
@@ -234,6 +242,9 @@ cd ~ && git clone https://github.com/xitihangto/SimplePDFReader.git && cd Simple
 # 2. 打 tag 并推送（tag 必须匹配 v* 格式）
 git tag v1.0.1
 git push --tags
+
+# 3. 等 CI 构建成功、Release 产物就绪后，把本机安装版更新到该产物
+./update.sh
 ```
 
 推送 tag 后，[`.github/workflows/release.yml`](.github/workflows/release.yml) 会自动：
@@ -253,6 +264,7 @@ git push --tags
 - **禁止**手工上传本地打包的 zip 作为 Release 附件。本地产物无法自证由仓库源码构建，会破坏产物的可溯源性。
 - Release 附件的上传者（uploader）应始终为 `github-actions[bot]`，可据此校验产物真伪。
 - 发版前请确认 CI 构建通过；构建失败时不要手工补传产物，应先修复源码或工作流。
+- **每次发版后必须更新本机安装版**：等 Release 产物就绪后执行 `./update.sh`，把 `/Applications/SimplePDFReader.app` 更新到该产物（下载 → 校验签名 → 旧版移废纸篓 → 安装），保持本机安装版与线上 Release 一致。
 
 ## 项目结构
 
@@ -265,6 +277,7 @@ SimplePDFReader/
 ├── AppIcon.icns                                # macOS 多分辨率原生图标包
 ├── generate_icon.swift                         # CoreGraphics 原生矢量图标生成脚本
 ├── build_app.sh                                # 一键编译与打包 .app 脚本
+├── update.sh                                   # 一键更新 /Applications 里的安装版（下载最新 CI 产物）
 ├── .github/workflows/release.yml               # GitHub Actions 自动构建与发布 Release 工作流
 └── Sources/
     └── SimplePDFReader/
