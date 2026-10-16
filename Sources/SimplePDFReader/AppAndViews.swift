@@ -1358,30 +1358,50 @@ final class FirstLaunchController: NSObject, ObservableObject, NSWindowDelegate 
         window.titlebarAppearsTransparent = true
         window.title = ""
         window.delegate = self
-        centerOnParent(window, parent: parent)
         modalWindow = window
         window.makeKeyAndOrderFront(nil)
+
+        // 为什么不能在这里同步算居中：NSHostingController 刚建窗时 SwiftUI 还没
+        // 布局，window.frame.size 是 0 —— 「先屏幕居中再平移到父窗口中心」的算法
+        // 会退化成「原点 = 父窗口中心」，面板**左上角**贴到主窗口正中、整体偏到
+        // 右下（v1.8.2 实测 bug）。内容真实尺寸要等布局 pass；而 runModal 会阻塞
+        // 主队列定时器，因此用 .common 模式的 Timer（模态会话的 runloop 里也能
+        // 触发）等下一轮布局，拿到真实尺寸后立即摆放。Timer 只差 ~10ms，
+        // 面板刚落幕就已在正确位置。
+        let placer = Timer(timeInterval: 0.01, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.modalWindow === window else { return }
+                self.placeOnParentCenter(window, parent: parent)
+            }
+        }
+        RunLoop.main.add(placer, forMode: .common)
 
         NSApp.runModal(for: window)
     }
 
-    /// 把面板放到**父窗口（主窗口）的正中间**。
-    /// 不能只用 `NSWindow.center()`—— 那按**屏幕**居中，而主窗口未必在屏幕正中
-    /// （由系统默认摆放位置 / 用户拖动后的位置决定），结果面板相对主窗口的位置
-    /// 显得随机。做法：先屏幕居中，再平移到父窗口中心；最后夹取在父窗口所在屏幕
-    /// 的可见区域内，保证多显示器 / 靠边摆放时也不越屏。
-    private func centerOnParent(_ window: NSWindow, parent: NSWindow) {
-        window.center()
+    /// 把面板摆到**父窗口（主窗口）的正中间**。
+    /// 直接按父窗口中心计算，不依赖 NSWindow.center()（那是按屏幕居中，主窗口
+    /// 未必在屏幕正中）。最后夹取在父窗口所在屏幕的可见区域内，多显示器或
+    /// 靠边摆放时也不越屏。
+    private func placeOnParentCenter(_ window: NSWindow, parent: NSWindow) {
+        // 兜底：万一布局仍未出尺寸，用内容视图 fittingSize 钉一次
+        if window.frame.width <= 0 || window.frame.height <= 0 {
+            let fit = window.contentView?.fittingSize ?? .zero
+            if fit.width > 0, fit.height > 0 {
+                window.setContentSize(fit)
+            }
+        }
+        guard window.frame.width > 0, window.frame.height > 0 else { return }
         guard let screen = parent.screen ?? NSScreen.main else { return }
         let visible = screen.visibleFrame
         var frame = window.frame
-        frame.origin.x += parent.frame.midX - frame.midX
-        frame.origin.y += parent.frame.midY - frame.midY
+        frame.origin.x = parent.frame.midX - frame.width / 2
+        frame.origin.y = parent.frame.midY - frame.height / 2
         frame.origin.x = min(max(frame.origin.x, visible.minX),
                              max(visible.minX, visible.maxX - frame.width))
         frame.origin.y = min(max(frame.origin.y, visible.minY),
                              max(visible.minY, visible.maxY - frame.height))
-        window.setFrame(frame, display: false)
+        window.setFrame(frame, display: true)
     }
 
     /// 用户点右上角关闭按钮：两项都不选，按程序默认值执行
@@ -1650,6 +1670,14 @@ struct ReaderCommands: Commands {
             Divider()
             Button("设为默认 PDF 阅读器…") {
                 AppSettings.shared.setAsDefaultPDFReader()
+            }
+
+            Divider()
+
+            // 重置为首次运行状态：下次启动重新询问初始化、恢复默认窗口模式。
+            // 开着任何多个 PDF 都能执行；只动本地设置，当前会话不受影响。
+            Button("重置应用…") {
+                AppSettings.shared.confirmResetToFirstRun()
             }
         }
 

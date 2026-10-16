@@ -102,6 +102,55 @@ final class AppSettings: ObservableObject {
         alert.addButton(withTitle: "好的")
         alert.runModal()
     }
+
+    /// 「重置应用…」：确认框 + 执行重置。只影响**本地设置**与**下次启动**，
+    /// 当前会话（已打开的文档、窗口布局）完全不动 —— 用户可以开着任意多个 PDF
+    /// 直接重置，重置后只要关闭再打开 app，就像首次安装时一样：
+    /// 重新弹出「首次运行 app 初始化」面板、窗口模式回到默认的多窗口。
+    func confirmResetToFirstRun() {
+        let alert = NSAlert()
+        alert.messageText = "确定要重置应用吗？"
+        alert.informativeText = """
+        将清除本应用的本地设置：首次运行的初始化记录（下次启动将重新询问），\
+        以及窗口模式（恢复默认的多窗口模式）。
+        当前会话不受影响；关闭并重新打开应用后，将如同首次运行。\
+        系统层面的默认 PDF 阅读器绑定不受影响。
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "重置")
+        // 第二个按钮是「重置」
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        resetToFirstRun()
+
+        Self.presentAlert(
+            message: "已重置",
+            info: "关闭并重新打开应用后，将像首次运行一样开始。",
+            style: .informational
+        )
+    }
+
+    /// 执行重置：删掉「已问过」标记、窗口模式、主窗口框架，让下次启动与首次安装一致。
+    ///
+    /// 为什么逐个 removeObject 而不是 removePersistentDomain：后者只删磁盘域，
+    /// 进程内存里还留着旧值——之后任何一次 synchronize（AppKit 写窗口框架就会
+    /// 触发）都会把旧值整体落回磁盘，重置被悄悄撤销。removeObject 内存与磁盘
+    /// 一致地删；NSNav* / NSOSPLastRootDirectory 这类系统面板键与「是否首次运行」
+    /// 无关，刻意保留。
+    func resetToFirstRun() {
+        let keysToReset: [String] = [
+            FirstLaunchController.hasPromptedDefaultReaderKey,
+            FirstLaunchController.hasPromptedWindowModeKey,
+            Self.windowModeKey,
+            "NSWindow Frame main",
+            "SimplePDFReader.restorableWindowPaths"   // 历史遗留键（已无人读）
+        ]
+        for key in keysToReset {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        UserDefaults.standard.synchronize()
+    }
 }
 
 // MARK: - 窗口模式的切换与执行
