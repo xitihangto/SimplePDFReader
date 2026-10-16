@@ -55,18 +55,28 @@ final class AppSettings: ObservableObject {
     /// 把本应用设为系统默认的 PDF 打开程序。
     /// 设置一次即对整个系统生效，因此天然属于「应用级」动作。
     func setAsDefaultPDFReader() {
+        setAsDefaultPDFReader(showResultAlert: true)
+    }
+
+    /// 静默版本：不弹任何结果提示。
+    /// 首次运行初始化面板用 —— 用户刚在面板里明确选了「设为默认」，
+    /// 确认后再弹一个「已设为默认」的确定框纯属打扰。
+    func setAsDefaultPDFReader(showResultAlert: Bool) {
         let appURL = Bundle.main.bundleURL
         guard appURL.pathExtension.lowercased() == "app" else {
-            Self.presentAlert(
-                message: "无法直接设置为默认阅读器",
-                info: "请直接双击运行打包好的 SimplePDFReader.app 后再执行此操作。",
-                style: .warning
-            )
+            if showResultAlert {
+                Self.presentAlert(
+                    message: "无法直接设置为默认阅读器",
+                    info: "请直接双击运行打包好的 SimplePDFReader.app 后再执行此操作。",
+                    style: .warning
+                )
+            }
             return
         }
 
         NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: .pdf) { error in
             Task { @MainActor in
+                guard showResultAlert else { return }
                 if let error = error {
                     Self.presentAlert(
                         message: "设置默认 PDF 阅读器失败",

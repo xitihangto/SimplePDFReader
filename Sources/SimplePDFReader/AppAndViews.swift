@@ -1180,15 +1180,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Combine 订阅（如「窗口模式」菜单勾选同步）
     private var cancellables = Set<AnyCancellable>()
 
-    /// 「是否设为默认 PDF 阅读器」是否已经问过。终身只问一次，
-    /// 且两个按钮（设为默认 / 以后再说）都算问过 —— 用户明确选了「以后再说」
-    /// 还反复打扰，那不是「仅提示一次」。
-    private static let hasPromptedDefaultReaderKey = "SimplePDFReader.hasPromptedDefaultReader"
-
-    /// 「习惯哪种窗口模式」是否已经问过。同样终身只问一次，
-    /// 两个按钮（多窗口 / 单窗口）都算问过。
-    private static let hasPromptedWindowModeKey = "SimplePDFReader.hasPromptedWindowMode"
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
@@ -1240,121 +1231,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上，
-    /// 并承担「首次启动引导」的触发点。
+    /// 并承担「首次运行初始化面板」的触发点。
     func windowDidBecomeReady(for window: NSWindow) {
-        promptFirstLaunchIfNeeded(on: window)
+        presentFirstLaunchOnboardingIfNeeded(on: window)
         drainPending()
     }
 
-    /// 首次启动的引导问题，依次两问：
-    /// ① 是否设为默认 PDF 阅读器；② 习惯哪种窗口模式（多窗口 / 单窗口）。
-    ///
-    /// 各问都终身只出现一次（任何选择都算问过，进场即落 UserDefaults 标记），
-    /// 且**第一个问题关闭后才问第二个**—— 一次只一件事，不叠 sheet。
-    /// windowDidBecomeReady 对每个新窗口都会触发，故用 firstLaunchPromptActive
-    /// 串行化：同一轮引导进行中时，后续窗口就绪不再触发，避免叠出两个 sheet。
-    private var firstLaunchPromptActive = false
+    /// 首次运行：弹「初始化面板」（默认阅读器 + 窗口模式，各两张选项卡 + 一个确认按钮）。
+    /// 面板本体见 FirstLaunchController；这里只负责「等窗口可见再弹」与重试。
+    private var onboardingRetries = 0
+    private static let maxOnboardingRetries = 20   // 20 × 0.3s ≈ 6s
 
-    /// 等窗口可见的重试计数：SwiftUI Window 场景的窗口在负载高时可能迟迟不上屏，
-    /// 而入场时 UserDefaults 标记已经落下 —— 一旦放弃，第①问就再也不会出现。
-    /// 因此这里隔一小段时间重试，而不是 silently give up。
-    private var firstLaunchRetries = 0
-    private static let maxFirstLaunchRetries = 20   // 20 × 0.3s ≈ 6s
-
-    private func promptFirstLaunchIfNeeded(on window: NSWindow) {
-        guard !firstLaunchPromptActive else { return }
-
-        if UserDefaults.standard.bool(forKey: Self.hasPromptedDefaultReaderKey) {
-            // 上次启动问完第①问就退出了：补问第②问
-            promptWindowModeIfNeeded(on: window)
-            return
-        }
-        firstLaunchPromptActive = true
-        firstLaunchRetries = 0
-        // 进场即落标记：哪怕用户在弹窗出现前就杀掉了应用，也不该再问第二次
-        UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
-
-        // 等窗口动画与布局稳定再挂 sheet，否则 sheet 可能挂到还没就位的窗口上；
-        // 窗口还没上屏就隔 0.3s 再试（最多约 6s），绝不静默放弃。
-        scheduleSheetOne(on: window)
+    private func presentFirstLaunchOnboardingIfNeeded(on window: NSWindow) {
+        guard !UserDefaults.standard.bool(forKey: FirstLaunchController.hasPromptedDefaultReaderKey) else { return }
+        scheduleOnboarding(on: window)
     }
 
-    private func scheduleSheetOne(on window: NSWindow) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + (firstLaunchRetries == 0 ? 0.6 : 0.3)) { [weak self] in
+    private func scheduleOnboarding(on window: NSWindow) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (onboardingRetries == 0 ? 0.6 : 0.3)) { [weak self] in
             guard let self else { return }
-            if !window.isVisible {
-                if firstLaunchRetries < Self.maxFirstLaunchRetries {
-                    firstLaunchRetries += 1
-                    scheduleSheetOne(on: window)
-                } else {
-                    firstLaunchPromptActive = false
+            guard window.isVisible else {
+                // SwiftUI Window 场景的窗口负载高时约 2~3s 才上屏；
+                // 等不到可见就隔 0.3s 再试，绝不静默放弃。
+                if onboardingRetries < Self.maxOnboardingRetries {
+                    onboardingRetries += 1
+                    scheduleOnboarding(on: window)
                 }
                 return
             }
-
-            let alert = NSAlert()
-            alert.messageText = "是否将 SimplePDFReader 设为默认 PDF 阅读器？"
-            alert.informativeText = "设为默认后，在 Finder 中双击 PDF 文件都会自动用 SimplePDFReader 打开。之后也可以在菜单「文件 → 设为默认 PDF 阅读器…」中随时更改。"
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "设为默认")
-            alert.addButton(withTitle: "以后再说")
-            alert.beginSheetModal(for: window) { [weak self] response in
-                Task { @MainActor in
-                    if response == .alertFirstButtonReturn {
-                        AppSettings.shared.setAsDefaultPDFReader()
-                    }
-                }
-                // 第①问关闭（无论怎么选）→ 接着问第②问
-                self?.promptWindowModeIfNeeded(on: window)
-            }
-        }
-    }
-
-    /// 首次启动的第②问：习惯哪种窗口模式。两个按钮点哪个即设哪种模式，
-    /// 同样终身只问一次。按钮顺序与程序默认值一致（多窗口在前）。
-    private func promptWindowModeIfNeeded(on window: NSWindow) {
-        guard !UserDefaults.standard.bool(forKey: Self.hasPromptedWindowModeKey) else {
-            firstLaunchPromptActive = false
-            return
-        }
-        firstLaunchPromptActive = true
-        firstLaunchRetries = 0
-        UserDefaults.standard.set(true, forKey: Self.hasPromptedWindowModeKey)
-
-        // 第①问的 sheet 刚收，留一拍让窗口回到可交互状态；
-        // 与第①问相同：窗口不可见就重试，不静默放弃。
-        scheduleSheetTwo(on: window)
-    }
-
-    private func scheduleSheetTwo(on window: NSWindow) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
-            if !window.isVisible {
-                if firstLaunchRetries < Self.maxFirstLaunchRetries {
-                    firstLaunchRetries += 1
-                    scheduleSheetTwo(on: window)
-                } else {
-                    firstLaunchPromptActive = false
-                }
-                return
-            }
-
-            let alert = NSAlert()
-            alert.messageText = "习惯使用哪种窗口模式？"
-            alert.informativeText = """
-                多窗口模式：允许应用同时持有多个窗口实例，可在多个窗口并排阅读不同文档，适合对照阅读；
-                单窗口模式：全局仅保留一个窗口实例，所有打开操作都只作用于该窗口，适合专注单份文档。
-                之后可随时在顶部菜单栏「窗口模式」中更改。
-                """
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "多窗口")
-            alert.addButton(withTitle: "单窗口")
-            alert.beginSheetModal(for: window) { response in
-                Task { @MainActor in
-                    AppSettings.shared.windowMode = (response == .alertFirstButtonReturn) ? .multi : .single
-                    self.firstLaunchPromptActive = false
-                }
-            }
+            FirstLaunchController.shared.present(on: window)
         }
     }
 
@@ -1394,6 +1299,199 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for url in urls {
             ReaderWindowManager.shared.openDocument(at: url)
         }
+    }
+}
+
+// MARK: - 首次运行初始化面板
+//
+// v1.7.x 的「两个 NSAlert sheet 依次问」被用户反馈「有点麻烦、感受偏复杂」，
+// v1.8.0 改为**一个**自定义面板：左右并列两个问题框，各含两张选项卡
+// （不是按钮 —— 未选中时两张样式一致，选中后带一圈主题色描边），
+// 底部一个「我选好了，确认」按钮：两框都未选完前灰色禁用，选定后才可按。
+// 用户明确要求「无出口，必须选完两项」，因此面板是**无关闭按钮的 app 模态窗口**
+// （Esc 无效），除了确认按钮没有任何离开路径。
+// 「已问过」标记只在**确认后**写入 —— 中途强杀应用不算问过，下次启动重新问。
+@MainActor
+final class FirstLaunchController: ObservableObject {
+    static let shared = FirstLaunchController()
+
+    /// 「是否设为默认 PDF 阅读器」是否已经问过（整个面板算一问）。
+    static let hasPromptedDefaultReaderKey = "SimplePDFReader.hasPromptedDefaultReader"
+    /// 「习惯哪种窗口模式」是否已经问过（与上一项同生共死：一个面板两问）。
+    static let hasPromptedWindowModeKey = "SimplePDFReader.hasPromptedWindowMode"
+
+    enum DefaultReaderChoice {
+        case setDefault
+        case later
+    }
+
+    /// 左框当前选择（nil = 未选）
+    @Published var defaultChoice: DefaultReaderChoice?
+    /// 右框当前选择（nil = 未选）
+    @Published var modeChoice: WindowMode?
+
+    /// 两框都选定后才能确认
+    var canConfirm: Bool { defaultChoice != nil && modeChoice != nil }
+
+    /// 面板是否正在展示（测试与排查用）
+    var isPresenting: Bool { modalWindow != nil }
+
+    private var modalWindow: NSWindow?
+
+    private init() {}
+
+    /// 弹出面板。调用方应确保窗口已可见；弹出后本方法会阻塞在模态会话里，
+    /// 直到用户点「我选好了，确认」（唯一出口）。
+    func present(on parent: NSWindow) {
+        guard modalWindow == nil else { return }
+
+        let hosting = NSHostingController(rootView: FirstLaunchView(controller: self))
+        let window = NSWindow(contentViewController: hosting)
+        // 只要标题栏、不要任何按钮：没有关闭按钮，模态会话也不响应 Esc ——
+        // 「无出口」要求的正是这个。窗口可拖动、可 miniaturize 都不重要。
+        window.styleMask = [.titled]
+        window.title = ""
+        window.center()
+        modalWindow = window
+        window.makeKeyAndOrderFront(nil)
+
+        NSApp.runModal(for: window)
+    }
+
+    /// 用户点「我选好了，确认」：静默应用两项选择、写标记、收面板。
+    func confirm() {
+        if defaultChoice == .setDefault {
+            // 静默设置：面板里已经明确选了「设为默认」，不再弹结果提示框
+            AppSettings.shared.setAsDefaultPDFReader(showResultAlert: false)
+        }
+        if let modeChoice {
+            AppSettings.shared.windowMode = modeChoice
+        }
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedWindowModeKey)
+
+        if let window = modalWindow {
+            NSApp.stopModal()
+            window.orderOut(nil)
+        }
+        modalWindow = nil
+    }
+}
+
+/// 初始化面板的 SwiftUI 内容：标题 + 左右两个问题框 + 底部确认按钮。
+struct FirstLaunchView: View {
+    @ObservedObject var controller: FirstLaunchController
+
+    var body: some View {
+        VStack(spacing: 20) {
+            VStack(spacing: 6) {
+                if let icon = NSApp.applicationIconImage {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 56, height: 56)
+                }
+                Text("首次运行 app 初始化")
+                    .font(.system(size: 17, weight: .medium))
+                Text("完成下面两项选择即可开始使用")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(alignment: .top, spacing: 16) {
+                questionPanel(title: "是否设为默认 PDF 阅读器？") {
+                    optionCard(
+                        title: "设为默认",
+                        desc: "在 Finder 中双击 PDF 时用本应用打开",
+                        selected: controller.defaultChoice == .setDefault
+                    ) { controller.defaultChoice = .setDefault }
+
+                    optionCard(
+                        title: "以后再说",
+                        desc: "暂不更改，之后可在菜单中随时设置",
+                        selected: controller.defaultChoice == .later
+                    ) { controller.defaultChoice = .later }
+                }
+
+                questionPanel(title: "习惯使用哪种窗口模式？") {
+                    optionCard(
+                        title: "多窗口模式",
+                        desc: "可同时持有多个窗口实例，并排阅读不同文档",
+                        selected: controller.modeChoice == .multi
+                    ) { controller.modeChoice = .multi }
+
+                    optionCard(
+                        title: "单窗口模式",
+                        desc: "全局仅保留一个窗口实例，打开只作用于该窗口",
+                        selected: controller.modeChoice == .single
+                    ) { controller.modeChoice = .single }
+                }
+            }
+
+            Button {
+                controller.confirm()
+            } label: {
+                Text("我选好了，确认")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(controller.canConfirm ? Color.white : Color.secondary)
+                    .frame(width: 160)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(controller.canConfirm
+                                  ? Color.accentColor
+                                  : Color(NSColor.controlBackgroundColor))
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!controller.canConfirm)
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    /// 一个问题框：标题 + 两张选项卡
+    private func questionPanel<Content: View>(
+        title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+            content()
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// 选项卡：不是按钮，是一张圆角矩形卡片 —— 未选中时与同类项样式一致，
+    /// 选中后多一圈主题色描边与浅色底纹。整张卡片可点。
+    private func optionCard(
+        title: String,
+        desc: String,
+        selected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+            Text(desc)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(selected ? Color.accentColor.opacity(0.08) : Color(NSColor.textBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(selected ? Color.accentColor : Color(NSColor.separatorColor),
+                        lineWidth: selected ? 2 : 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+        .onTapGesture(perform: action)
     }
 }
 
