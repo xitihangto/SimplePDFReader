@@ -1,5 +1,15 @@
 # 版本更新记录 (Changelog)
 
+## [v1.8.2] - 2026-10-16
+
+### 修复：首次运行初始化面板改为相对主窗口居中
+
+v1.8.1 及更早版本用 `NSWindow.center()` 把面板按**屏幕**居中，而主窗口本身未必在屏幕正中（由系统默认摆放位置 / 用户拖动后的位置决定），导致面板相对主窗口的位置看起来随机、并未真正居中。现改为**相对父窗口（主窗口）居中**：先屏幕居中，再平移到父窗口中心；最后夹取在父窗口所在屏幕的可见区域内，多显示器或靠边摆放时也不越屏。
+
+### 顺带修复：沙箱内本机构建签名失败
+
+沙箱内新建的 bundle 顶层目录会被盖上 `com.apple.FinderInfo`（Finder 信息），codesign 会因此报 `resource fork, Finder information, or similar detritus not allowed` 而静默失败。`build_app.sh` 的清理步骤增加对顶层 bundle 的 `com.apple.FinderInfo` / `com.apple.fileprovider.fpfs#P` 显式删除（`com.apple.provenance` 为 macOS 26 内核属性、用户态不可删，实测不影响签名有效性，无需处理）。
+
 ## [v1.8.1] - 2026-10-16
 
 ### 界面优化：初始化面板微调 + 新增「关闭」出口

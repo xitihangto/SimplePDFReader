@@ -1358,11 +1358,30 @@ final class FirstLaunchController: NSObject, ObservableObject, NSWindowDelegate 
         window.titlebarAppearsTransparent = true
         window.title = ""
         window.delegate = self
-        window.center()
+        centerOnParent(window, parent: parent)
         modalWindow = window
         window.makeKeyAndOrderFront(nil)
 
         NSApp.runModal(for: window)
+    }
+
+    /// 把面板放到**父窗口（主窗口）的正中间**。
+    /// 不能只用 `NSWindow.center()`—— 那按**屏幕**居中，而主窗口未必在屏幕正中
+    /// （由系统默认摆放位置 / 用户拖动后的位置决定），结果面板相对主窗口的位置
+    /// 显得随机。做法：先屏幕居中，再平移到父窗口中心；最后夹取在父窗口所在屏幕
+    /// 的可见区域内，保证多显示器 / 靠边摆放时也不越屏。
+    private func centerOnParent(_ window: NSWindow, parent: NSWindow) {
+        window.center()
+        guard let screen = parent.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+        frame.origin.x += parent.frame.midX - frame.midX
+        frame.origin.y += parent.frame.midY - frame.midY
+        frame.origin.x = min(max(frame.origin.x, visible.minX),
+                             max(visible.minX, visible.maxX - frame.width))
+        frame.origin.y = min(max(frame.origin.y, visible.minY),
+                             max(visible.minY, visible.maxY - frame.height))
+        window.setFrame(frame, display: false)
     }
 
     /// 用户点右上角关闭按钮：两项都不选，按程序默认值执行

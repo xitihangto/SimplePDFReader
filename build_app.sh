@@ -147,7 +147,16 @@ echo "3. 正在清理扩展属性并做本地签名..."
 # （报错 "resource fork, Finder information, or similar detritus not allowed"）。
 # 必须先清除全部扩展属性，否则签名会静默失败，产物只带有链接器的临时签名、
 # 且 Info.plist 不会被绑定，导致 codesign --verify 校验不通过。
-xattr -cr "$APP_BUNDLE"
+xattr -cr "$APP_BUNDLE" || true
+
+# 顶层 bundle 目录还可能被盖上 com.apple.FinderInfo / com.apple.fileprovider.fpfs#P
+# （沙箱内新建文件、或 Finder 触碰过都会留下）—— codesign 同样视为 detritus 拒绝，
+# 报同样的 "resource fork, Finder information, or similar detritus not allowed"。
+# com.apple.provenance 是 macOS 26 的内核属性、用户态删不掉，但实测不影响签名
+# 有效性（codesign --verify 照常通过），留着即可，无需处理。
+for attr in com.apple.FinderInfo com.apple.fileprovider.fpfs#P; do
+  xattr -d "$attr" "$APP_BUNDLE" 2>/dev/null || true
+done
 
 # 注意：这里不要再用 NSWorkspace.setIcon() 去写 Finder 自定义图标——
 # 那一步会往 bundle 里塞入 Icon\r 文件与 ResourceFork/FinderInfo 属性，
