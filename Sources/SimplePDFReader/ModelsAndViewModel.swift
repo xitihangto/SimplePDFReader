@@ -292,15 +292,16 @@ final class PDFReaderViewModel: ObservableObject {
     ///   · 本窗口正好是空的 → 就地填入；
     ///   · 本窗口已有内容 → **新开一个窗口**，绝不顶掉当前正在看的东西。
     func openDocumentPanel() {
-        guard let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") else { return }
-        let originWindow = WindowRegistry.shared.session(owning: self)?.window
+        let originWindow = WindowPlacement.frontWindow(owning: self)
+        guard let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件", parent: originWindow) else { return }
         ReaderWindowManager.shared.openDocument(at: url, preferring: originWindow)
     }
 
     /// 「换文件」按钮：为某个分屏单独打开一份对比 PDF（只影响该分屏）。
     func openDocumentPanel(forPaneIndex paneIndex: Int) {
         let title = "为分屏 #\(paneIndex + 1) 选择 PDF 文件"
-        guard let url = PDFOpenPanel.choose(title: title) else { return }
+        let originWindow = WindowPlacement.frontWindow(owning: self)
+        guard let url = PDFOpenPanel.choose(title: title, parent: originWindow) else { return }
         loadPDF(from: url, intoPane: paneIndex)
     }
 
@@ -351,7 +352,8 @@ final class PDFReaderViewModel: ObservableObject {
             alert.messageText = "无法打开 PDF 文件"
             alert.informativeText = "文件可能已损坏或受密码保护：\(url.lastPathComponent)"
             alert.alertStyle = .warning
-            alert.runModal()
+            // 相对本窗口（ViewModel 所属会话）居中
+            WindowPlacement.runAlertModal(alert, parent: WindowPlacement.frontWindow(owning: self))
             return
         }
 

@@ -58,49 +58,87 @@ final class AppSettings: ObservableObject {
         setAsDefaultPDFReader(showResultAlert: true)
     }
 
-    /// 静默版本：不弹任何结果提示。
-    /// 首次运行初始化面板用 —— 用户刚在面板里明确选了「设为默认」，
-    /// 确认后再弹一个「已设为默认」的确定框纯属打扰。
+    /// 设为系统默认 PDF 阅读器。
+    /// - Parameter showResultAlert:
+    ///   · `false`（首次运行初始化面板用）：静默调用系统绑定，不弹任何应用内提示框；
+    ///   · `true`（菜单项主动触发）：遵循「一个功能最多 1 个弹窗」原则 ——
+    ///     若本应用尚未是默认阅读器，调用系统 API 时 macOS（CoreServicesUIAgent）已会弹出
+    ///     一次系统确认框，因此确认或取消后不再追加第二个应用内弹窗；
+    ///     若本应用已经是默认阅读器，macOS 不会再弹系统框，此时弹出一次相对主窗口居中的
+    ///     提示框给出明确反馈。
     func setAsDefaultPDFReader(showResultAlert: Bool) {
         let appURL = Bundle.main.bundleURL
+        let parentWindow = WindowPlacement.frontWindow()
         guard appURL.pathExtension.lowercased() == "app" else {
             if showResultAlert {
                 Self.presentAlert(
                     message: "无法直接设置为默认阅读器",
                     info: "请直接双击运行打包好的 SimplePDFReader.app 后再执行此操作。",
-                    style: .warning
+                    style: .warning,
+                    parent: parentWindow
                 )
             }
             return
         }
 
+        let wasAlreadyDefault = Self.isAlreadyDefaultPDFReader(for: appURL)
+
         NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: .pdf) { error in
             Task { @MainActor in
                 guard showResultAlert else { return }
-                if let error = error {
+                if let error = error as NSError? {
+                    // 用户在系统确认框中点「保留原应用」（取消）属于正常中止，不再弹二次报错框
+                    if (error.domain == NSCocoaErrorDomain && error.code == NSUserCancelledError)
+                        || (error.domain == NSOSStatusErrorDomain && error.code == -128) {
+                        return
+                    }
                     Self.presentAlert(
                         message: "设置默认 PDF 阅读器失败",
                         info: error.localizedDescription,
-                        style: .warning
+                        style: .warning,
+                        parent: parentWindow
                     )
-                } else {
+                } else if wasAlreadyDefault {
                     Self.presentAlert(
                         message: "已设为默认 PDF 阅读器",
-                        info: "设置已完成，今后在 Finder 中双击任何 PDF 文件都会默认使用 SimplePDFReader 打开。",
-                        style: .informational
+                        info: "当前 SimplePDFReader 已是系统默认的 PDF 打开程序，在 Finder 中双击任何 PDF 文件都会默认使用本应用打开。",
+                        style: .informational,
+                        parent: parentWindow
                     )
                 }
             }
         }
     }
 
-    private static func presentAlert(message: String, info: String, style: NSAlert.Style) {
+    /// 判断本应用当前是否已经是系统默认的 PDF 打开程序（按路径或 Bundle ID 匹配）。
+    private static func isAlreadyDefaultPDFReader(for appURL: URL) -> Bool {
+        guard let currentURL = NSWorkspace.shared.urlForApplication(toOpen: .pdf) else {
+            return false
+        }
+        if currentURL.standardizedFileURL == appURL.standardizedFileURL {
+            return true
+        }
+        if let currentBundleID = Bundle(url: currentURL)?.bundleIdentifier,
+           let myBundleID = Bundle.main.bundleIdentifier,
+           currentBundleID == myBundleID {
+            return true
+        }
+        return false
+    }
+
+    private static func presentAlert(
+        message: String,
+        info: String,
+        style: NSAlert.Style,
+        parent: NSWindow? = nil
+    ) {
         let alert = NSAlert()
         alert.messageText = message
         alert.informativeText = info
         alert.alertStyle = style
         alert.addButton(withTitle: "好的")
-        alert.runModal()
+        // 相对主窗口居中，而不是系统默认的按屏幕居中
+        WindowPlacement.runAlertModal(alert, parent: parent)
     }
 
     /// 「重置应用…」：确认框 + 执行重置。只影响**本地设置**与**下次启动**，
@@ -119,16 +157,10 @@ final class AppSettings: ObservableObject {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "重置")
-        // 第二个按钮是「重置」
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
-
+        // 相对主窗口居中；第二个按钮是「重置」。确认框文案已说明全部后果，
+        // 因此不再弹第二个结果框 —— 一次弹窗把这事办完。
+        guard WindowPlacement.runAlertModal(alert) == .alertSecondButtonReturn else { return }
         resetToFirstRun()
-
-        Self.presentAlert(
-            message: "已重置",
-            info: "关闭并重新打开应用后，将像首次运行一样开始。",
-            style: .informational
-        )
     }
 
     /// 执行重置：删掉「已问过」标记、窗口模式、主窗口框架，让下次启动与首次安装一致。
@@ -153,6 +185,102 @@ final class AppSettings: ObservableObject {
     }
 }
 
+// MARK: - 窗口摆放对齐（所有弹窗/面板统一「相对主窗口居中」）
+//
+// 系统默认行为与「主窗口居中」相差很远：
+//   · NSAlert.runModal() 内部会调用 alert.layout() 与 alert.window.center()，
+//     不仅按**屏幕**居中，还会把 runModal() 之前设好的窗口坐标覆盖掉；
+//   · beginSheetModal 的 sheet 挂在窗口**顶部**——也不是居中。
+// 这里统一收敛为一套逻辑，与首启动初始化面板（FirstLaunchController）一致：
+// 直接按父窗口（主阅读窗口）中心计算位置，夹取在父窗口所在屏幕的可见区域内，
+// 并在模态 RunLoop（.common / .modalPanel）启动后立即执行定位，覆盖系统默认的屏幕居中。
+enum WindowPlacement {
+    /// 弹窗/面板最适合当「位置参考」的主阅读窗口：
+    /// 优先取指定 ViewModel 所属窗口 → 当前激活的阅读器窗口 → 最近活跃的阅读器窗口 →
+    /// 兜底为 mainWindow / keyWindow（避免「关于」等小面板成为焦点时把小面板当成参考父窗口）。
+    @MainActor
+    static func frontWindow(owning viewModel: PDFReaderViewModel? = nil) -> NSWindow? {
+        if let viewModel,
+           let window = WindowRegistry.shared.session(owning: viewModel)?.window,
+           window.isVisible {
+            return window
+        }
+        if let active = WindowRegistry.shared.activeSession?.window, active.isVisible {
+            return active
+        }
+        if let recent = WindowRegistry.shared.mostRecentSession?.window, recent.isVisible {
+            return recent
+        }
+        if let main = NSApp.mainWindow, main.isVisible { return main }
+        if let key = NSApp.keyWindow, key.isVisible { return key }
+        return NSApp.windows.first { $0.isVisible && $0.canBecomeMain }
+    }
+
+    /// 把窗口摆到 parent 的**正中间**（先落实内容尺寸），夹取在 parent
+    /// 所在屏幕的可见区域内，多显示器 / 靠边摆放也不越屏。
+    @MainActor
+    static func centerOnParent(_ window: NSWindow, parent: NSWindow) {
+        guard window !== parent else { return }
+        window.contentView?.layoutSubtreeIfNeeded()
+        // 兜底：SwiftUI/NSAlert 布局未出尺寸时，用内容视图 fittingSize 钉一次
+        if window.frame.width <= 0 || window.frame.height <= 0 {
+            let fit = window.contentView?.fittingSize ?? .zero
+            if fit.width > 0, fit.height > 0 {
+                window.setContentSize(fit)
+            }
+        }
+        guard window.frame.width > 0, window.frame.height > 0 else { return }
+        guard let screen = parent.screen ?? window.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+        frame.origin.x = round(parent.frame.midX - frame.width / 2)
+        frame.origin.y = round(parent.frame.midY - frame.height / 2)
+        frame.origin.x = min(max(frame.origin.x, visible.minX),
+                             max(visible.minX, visible.maxX - frame.width))
+        frame.origin.y = min(max(frame.origin.y, visible.minY),
+                             max(visible.minY, visible.maxY - frame.height))
+        window.setFrame(frame, display: true)
+    }
+
+    /// 在模态会话（runModal）启动阶段把窗口钉到 parent 中心。
+    ///
+    /// 为什么必须在模态 RunLoop 内再钉：
+    ///   · `NSAlert.runModal()` 内部会同步调用 `alert.window.center()`，把进入 `runModal()`
+    ///     之前设置的坐标重新覆盖回屏幕正中央；
+    ///   · `NSHostingController` / `NSOpenPanel` 的真实尺寸往往在首轮布局 pass 后才就绪。
+    /// 因此这里通过 `.common` / `.modalPanel` 模式的 RunLoop 回调与短时 Timer（10ms / 50ms）
+    /// 在模态会话启动后立即重算并居中，与首次运行引导面板（FirstLaunchController）完全一致。
+    @MainActor
+    static func scheduleModalCentering(_ window: NSWindow, parent: NSWindow) {
+        RunLoop.main.perform(inModes: [.common, .modalPanel]) {
+            MainActor.assumeIsolated {
+                centerOnParent(window, parent: parent)
+            }
+        }
+        for delay in [0.01, 0.05] {
+            let timer = Timer(timeInterval: delay, repeats: false) { _ in
+                MainActor.assumeIsolated {
+                    guard window.isVisible else { return }
+                    centerOnParent(window, parent: parent)
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    /// NSAlert 专用：跑 app 模态，并确保提示框相对 parent（主窗口）居中。
+    @MainActor
+    @discardableResult
+    static func runAlertModal(_ alert: NSAlert, parent: NSWindow? = nil) -> NSApplication.ModalResponse {
+        guard let parent = parent ?? frontWindow() else { return alert.runModal() }
+        alert.layout()
+        let window = alert.window
+        centerOnParent(window, parent: parent)
+        scheduleModalCentering(window, parent: parent)
+        return alert.runModal()
+    }
+}
+
 // MARK: - 窗口模式的切换与执行
 //
 // 单窗口 / 多窗口的切换涉及「关闭别的窗口」这种不可逆动作，因此单独放在一个
@@ -168,6 +296,22 @@ final class WindowModeController {
     static let shared = WindowModeController()
 
     private init() {}
+
+    /// 从菜单栏「窗口模式 → 单窗口模式」触发：解析当前激活（或最近活跃）的阅读器窗口，
+    /// 若存在多个窗口则先弹出相对主窗口居中的确认框，确认后关闭其余窗口；
+    /// 若用户点「取消」，则保持多窗口模式并立即刷新菜单勾选状态。
+    func requestSingleMode() {
+        guard AppSettings.shared.windowMode != .single else {
+            WindowModeMenuSync.refresh()
+            return
+        }
+        if let session = WindowRegistry.shared.activeSession ?? WindowRegistry.shared.mostRecentSession {
+            toggle(fromWindowOf: session.viewModel)
+        } else {
+            AppSettings.shared.windowMode = .single
+        }
+        WindowModeMenuSync.refresh()
+    }
 
     /// 在两种窗口模式间切换（工具栏按钮 / 菜单项调用）。
     /// - Parameter viewModel: 发起切换的那个窗口的 ViewModel。
@@ -187,7 +331,7 @@ final class WindowModeController {
             return
         }
 
-        // 弹窗挂在发起切换的窗口上；拿不到窗口就不弹，直接切换。
+        // 弹窗以发起切换的窗口为位置参考；拿不到窗口就不弹，直接切换。
         guard let window = WindowRegistry.shared.session(owning: viewModel)?.window else {
             AppSettings.shared.windowMode = .single
             return
@@ -195,17 +339,15 @@ final class WindowModeController {
 
         let alert = NSAlert()
         alert.messageText = "仅保留本窗口，其他窗口关闭并切换到单窗口模式"
-        alert.informativeText = "当前共有 \(otherCount + 1) 个窗口。切换到单窗口模式后，只有按下切换按钮的这个窗口会保留，其余 \(otherCount) 个窗口将被关闭。"
+        alert.informativeText = "当前共有 \(otherCount + 1) 个窗口。切换到单窗口模式后，只有当前这个窗口会保留，其余 \(otherCount) 个窗口将被关闭。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "切换到单窗口")
         alert.addButton(withTitle: "取消")
 
-        alert.beginSheetModal(for: window) { [weak self] response in
-            Task { @MainActor in
-                guard response == .alertFirstButtonReturn else { return }
-                self?.switchToSingle(keeping: viewModel)
-            }
-        }
+        // 相对发起切换的窗口居中（与首启动面板、其它弹窗同一套摆放逻辑）
+        let response = WindowPlacement.runAlertModal(alert, parent: window)
+        guard response == .alertFirstButtonReturn else { return }
+        switchToSingle(keeping: viewModel)
     }
 
     /// 确认后真正执行「切到单窗口」：设置模式 + 关闭除 keeper 之外的所有窗口。
@@ -269,12 +411,17 @@ enum WindowModeMenuSync {
 // MARK: - 选择 PDF 的系统面板
 @MainActor
 enum PDFOpenPanel {
-    static func choose(title: String) -> URL? {
+    static func choose(title: String, parent: NSWindow? = nil) -> URL? {
+        let targetParent = parent ?? WindowPlacement.frontWindow()
         let panel = NSOpenPanel()
         panel.title = title
         panel.allowedContentTypes = [.pdf]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        if let targetParent {
+            WindowPlacement.centerOnParent(panel, parent: targetParent)
+            WindowPlacement.scheduleModalCentering(panel, parent: targetParent)
+        }
         return panel.runModal() == .OK ? panel.url : nil
     }
 }

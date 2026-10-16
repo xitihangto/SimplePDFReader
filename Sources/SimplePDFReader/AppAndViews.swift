@@ -1121,6 +1121,7 @@ enum AboutWindow {
     private static var panel: NSWindow?
 
     static func show() {
+        let parent = WindowPlacement.frontWindow()
         if panel == nil {
             let hosting = NSHostingController(rootView: AboutView(
                 icon: NSApp.applicationIconImage ?? NSImage(),
@@ -1130,10 +1131,20 @@ enum AboutWindow {
             newPanel.title = "关于 \(AppMetadata.displayName)"
             newPanel.styleMask = [.titled, .closable]
             newPanel.isReleasedWhenClosed = false
-            newPanel.center()
             panel = newPanel
         }
-        panel?.makeKeyAndOrderFront(nil)
+        guard let aboutPanel = panel else { return }
+        if let parent {
+            WindowPlacement.centerOnParent(aboutPanel, parent: parent)
+        } else {
+            aboutPanel.center()
+        }
+        aboutPanel.makeKeyAndOrderFront(nil)
+        if let parent {
+            DispatchQueue.main.async {
+                WindowPlacement.centerOnParent(aboutPanel, parent: parent)
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -1359,49 +1370,11 @@ final class FirstLaunchController: NSObject, ObservableObject, NSWindowDelegate 
         window.title = ""
         window.delegate = self
         modalWindow = window
+        WindowPlacement.centerOnParent(window, parent: parent)
         window.makeKeyAndOrderFront(nil)
-
-        // 为什么不能在这里同步算居中：NSHostingController 刚建窗时 SwiftUI 还没
-        // 布局，window.frame.size 是 0 —— 「先屏幕居中再平移到父窗口中心」的算法
-        // 会退化成「原点 = 父窗口中心」，面板**左上角**贴到主窗口正中、整体偏到
-        // 右下（v1.8.2 实测 bug）。内容真实尺寸要等布局 pass；而 runModal 会阻塞
-        // 主队列定时器，因此用 .common 模式的 Timer（模态会话的 runloop 里也能
-        // 触发）等下一轮布局，拿到真实尺寸后立即摆放。Timer 只差 ~10ms，
-        // 面板刚落幕就已在正确位置。
-        let placer = Timer(timeInterval: 0.01, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.modalWindow === window else { return }
-                self.placeOnParentCenter(window, parent: parent)
-            }
-        }
-        RunLoop.main.add(placer, forMode: .common)
+        WindowPlacement.scheduleModalCentering(window, parent: parent)
 
         NSApp.runModal(for: window)
-    }
-
-    /// 把面板摆到**父窗口（主窗口）的正中间**。
-    /// 直接按父窗口中心计算，不依赖 NSWindow.center()（那是按屏幕居中，主窗口
-    /// 未必在屏幕正中）。最后夹取在父窗口所在屏幕的可见区域内，多显示器或
-    /// 靠边摆放时也不越屏。
-    private func placeOnParentCenter(_ window: NSWindow, parent: NSWindow) {
-        // 兜底：万一布局仍未出尺寸，用内容视图 fittingSize 钉一次
-        if window.frame.width <= 0 || window.frame.height <= 0 {
-            let fit = window.contentView?.fittingSize ?? .zero
-            if fit.width > 0, fit.height > 0 {
-                window.setContentSize(fit)
-            }
-        }
-        guard window.frame.width > 0, window.frame.height > 0 else { return }
-        guard let screen = parent.screen ?? NSScreen.main else { return }
-        let visible = screen.visibleFrame
-        var frame = window.frame
-        frame.origin.x = parent.frame.midX - frame.width / 2
-        frame.origin.y = parent.frame.midY - frame.height / 2
-        frame.origin.x = min(max(frame.origin.x, visible.minX),
-                             max(visible.minX, visible.maxX - frame.width))
-        frame.origin.y = min(max(frame.origin.y, visible.minY),
-                             max(visible.minY, visible.maxY - frame.height))
-        window.setFrame(frame, display: true)
     }
 
     /// 用户点右上角关闭按钮：两项都不选，按程序默认值执行
@@ -1691,8 +1664,9 @@ struct ReaderCommands: Commands {
             // 没开着就新开窗口，已经开着就聚焦已有窗口，本窗口空着就地填入。
             // 因此绝不会顶掉当前窗口正在看的内容。
             Button("打开 PDF…") {
-                if let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") {
-                    ReaderWindowManager.shared.openDocument(at: url)
+                let parent = WindowPlacement.frontWindow()
+                if let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件", parent: parent) {
+                    ReaderWindowManager.shared.openDocument(at: url, preferring: parent)
                 }
             }
             .keyboardShortcut("o", modifiers: [.command])
@@ -1705,12 +1679,6 @@ struct ReaderCommands: Commands {
                 reader?.closeDocument()
             }
             .keyboardShortcut("w", modifiers: [.command, .option])
-
-            Divider()
-
-            Button("设为默认 PDF 阅读器…") {
-                AppSettings.shared.setAsDefaultPDFReader()
-            }
         }
 
         // 顶级「窗口模式」菜单：多窗口 / 单窗口，当前生效者带勾。
@@ -1720,12 +1688,23 @@ struct ReaderCommands: Commands {
             Toggle("多窗口", isOn: Binding(
                 get: { appSettings.windowMode == .multi },
                 // 点已勾选项会传入 false，忽略即可（不允许「两个都不勾」）
-                set: { if $0 { AppSettings.shared.windowMode = .multi } }
+                set: {
+                    if $0 {
+                        AppSettings.shared.windowMode = .multi
+                    }
+                    WindowModeMenuSync.refresh()
+                }
             ))
 
             Toggle("单窗口模式", isOn: Binding(
                 get: { appSettings.windowMode == .single },
-                set: { if $0 { AppSettings.shared.windowMode = .single } }
+                set: {
+                    if $0 {
+                        WindowModeController.shared.requestSingleMode()
+                    } else {
+                        WindowModeMenuSync.refresh()
+                    }
+                }
             ))
         }
 

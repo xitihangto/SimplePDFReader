@@ -158,6 +158,26 @@ for attr in com.apple.FinderInfo com.apple.fileprovider.fpfs#P; do
   xattr -d "$attr" "$APP_BUNDLE" 2>/dev/null || true
 done
 
+# 清理与签名之间存在异步竞争：系统守护进程可能在清理后、签名前的毫秒级窗口里
+# 又把 FinderInfo 盖回来（本沙箱内实测复现过）。因此签名带重试：每次重新清理
+# 后立即签，最多 3 次；仍失败才报错退出。
+sign_ok=0
+for attempt in 1 2 3; do
+  if codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null; then
+    sign_ok=1
+    break
+  fi
+  echo "签名失败（第 ${attempt} 次，疑似扩展属性被重新盖上），重新清理后重试..." >&2
+  xattr -cr "$APP_BUNDLE" || true
+  for attr in com.apple.FinderInfo com.apple.fileprovider.fpfs#P; do
+    xattr -d "$attr" "$APP_BUNDLE" 2>/dev/null || true
+  done
+done
+if [ "$sign_ok" != 1 ]; then
+  echo "错误：本地签名失败（多次重试后仍有扩展属性干扰）。" >&2
+  exit 1
+fi
+
 # 注意：这里不要再用 NSWorkspace.setIcon() 去写 Finder 自定义图标——
 # 那一步会往 bundle 里塞入 Icon\r 文件与 ResourceFork/FinderInfo 属性，
 # 正是导致上面签名失败的元凶。App 图标由 Info.plist 的 CFBundleIconFile
