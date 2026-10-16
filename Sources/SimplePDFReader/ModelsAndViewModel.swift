@@ -112,6 +112,8 @@ final class PaneState: ObservableObject, Identifiable {
     /// 若在分屏中单独打开了另一份对比 PDF，则保存在此处；若为 nil 则默认共享主文档
     @Published var customDocument: PDFDocument? = nil
     @Published var customFileName: String? = nil
+    /// 对比文档的来源路径。用于共享文档缓存的回收判断，以及重新打开同一文件时命中缓存。
+    @Published var customFileURL: URL? = nil
 
     @Published var currentPageNumber: Int = 1
     @Published var pageInputText: String = "1"
@@ -224,13 +226,20 @@ final class PDFReaderViewModel: ObservableObject {
     private var lastSearchedQuery: String = ""
     private var isPerformingProgrammaticLayoutChange = false
 
-    init() {
+    init(initialFileURL: URL? = nil) {
         // 将所有子分屏 PaneState 的变更转发至顶层 ViewModel，确保 SwiftUI 视图实时刷新
         for pane in panes {
             let c = pane.objectWillChange.sink { [weak self] _ in
                 self?.objectWillChange.send()
             }
             paneCancellables.append(c)
+        }
+
+        // 窗口创建时若已指定文件（来自 Finder 打开 / 新建窗口时带文件），
+        // 直接加载。此刻 PDFView 还不存在，但模型是权威的 ——
+        // makeNSView 会按模型把文档、缩放、页码应用上去。
+        if let url = initialFileURL {
+            loadPDF(from: url, silently: true)
         }
     }
 
@@ -261,36 +270,6 @@ final class PDFReaderViewModel: ObservableObject {
         }
     }
 
-    // MARK: - 设为系统默认 PDF 阅读器
-    func setAsDefaultPDFReader() {
-        let appURL = Bundle.main.bundleURL
-        guard appURL.pathExtension.lowercased() == "app" else {
-            let alert = NSAlert()
-            alert.messageText = "无法直接设置为默认阅读器"
-            alert.informativeText = "请直接双击运行打包好的 SimplePDFReader.app 后再执行此操作。"
-            alert.alertStyle = .warning
-            alert.runModal()
-            return
-        }
-
-        NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: .pdf) { error in
-            Task { @MainActor in
-                let alert = NSAlert()
-                if let error = error {
-                    alert.messageText = "设置默认 PDF 阅读器失败"
-                    alert.informativeText = error.localizedDescription
-                    alert.alertStyle = .warning
-                } else {
-                    alert.messageText = "已设为默认 PDF 阅读器"
-                    alert.informativeText = "设置已完成，今后在 Finder 中双击任何 PDF 文件都会默认使用 SimplePDFReader 打开。"
-                    alert.alertStyle = .informational
-                }
-                alert.addButton(withTitle: "好的")
-                alert.runModal()
-            }
-        }
-    }
-
     // MARK: - 侧边栏按需开启控制
     func toggleSidebar() {
         showSidebar.toggle()
@@ -305,24 +284,23 @@ final class PDFReaderViewModel: ObservableObject {
 
     // MARK: - 打开 PDF 文件
     func openDocumentPanel(forPaneIndex paneIndex: Int? = nil) {
-        let panel = NSOpenPanel()
-        panel.title = paneIndex == nil ? "选择要打开的 PDF 文件" : "为分屏 #\(paneIndex! + 1) 选择 PDF 文件"
-        panel.allowedContentTypes = [.pdf]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-
-        if panel.runModal() == .OK, let url = panel.url {
-            loadPDF(from: url, intoPane: paneIndex)
-        }
+        let title = paneIndex == nil
+            ? "选择要打开的 PDF 文件"
+            : "为分屏 #\((paneIndex ?? 0) + 1) 选择 PDF 文件"
+        guard let url = PDFOpenPanel.choose(title: title) else { return }
+        loadPDF(from: url, intoPane: paneIndex)
     }
 
-    func loadPDF(from url: URL, intoPane paneIndex: Int? = nil) {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer {
-            if accessed { url.stopAccessingSecurityScopedResource() }
-        }
-
-        guard let doc = PDFDocument(url: url) else {
+    /// 加载 PDF。
+    ///
+    /// - Parameters:
+    ///   - paneIndex: 指定则加载到该分屏（作为对比文档）；nil 则作为本窗口的主文档。
+    ///   - silently: 失败时不弹模态框。用于「窗口创建时自动恢复文件」这类场景 ——
+    ///     此时弹框会打断启动流程，而且用户并没有主动发起这次打开。
+    func loadPDF(from url: URL, intoPane paneIndex: Int? = nil, silently: Bool = false) {
+        // 同一份文件被多个窗口打开时复用同一个 PDFDocument 实例
+        guard let doc = DocumentStore.shared.document(at: url) else {
+            guard !silently else { return }
             let alert = NSAlert()
             alert.messageText = "无法打开 PDF 文件"
             alert.informativeText = "文件可能已损坏或受密码保护：\(url.lastPathComponent)"
@@ -335,6 +313,7 @@ final class PDFReaderViewModel: ObservableObject {
             let pane = panes[targetPaneIdx]
             pane.customDocument = doc
             pane.customFileName = url.lastPathComponent
+            pane.customFileURL = url
             pane.currentPageNumber = 1
             pane.pageInputText = "1"
             pane.scaleFactor = 1.0
@@ -346,6 +325,7 @@ final class PDFReaderViewModel: ObservableObject {
             if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 performSearch(animateSelection: false)
             }
+            WindowRegistry.shared.sweepDocuments(alsoKeeping: [url])
             return
         }
 
@@ -380,6 +360,10 @@ final class PDFReaderViewModel: ObservableObject {
             let currentScale = activePane.livePDFView?.scaleFactor ?? 1.0
             applySmartZoomLayout(forScale: currentScale, force: true)
         }
+
+        // 换文档后，旧文档若已无人使用则从共享缓存中回收。
+        // 注意要把刚装上的这份也标为「在用」——此刻本窗口可能还没登记进登记表。
+        WindowRegistry.shared.sweepDocuments(alsoKeeping: [url])
     }
 
     func clearCustomDocument(inPane paneIndex: Int) {
@@ -387,6 +371,7 @@ final class PDFReaderViewModel: ObservableObject {
         let pane = panes[paneIndex]
         pane.customDocument = nil
         pane.customFileName = nil
+        pane.customFileURL = nil
         pane.livePDFView?.document = primaryDocument
         if let doc = primaryDocument {
             let pageIdx = min(max(panes[0].currentPageNumber - 1 + paneIndex, 0), max(doc.pageCount - 1, 0))

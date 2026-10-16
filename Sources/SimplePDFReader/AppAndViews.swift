@@ -973,57 +973,6 @@ struct ContentView: View {
     }
 }
 
-// MARK: - App 代理与主入口
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    var viewModel: PDFReaderViewModel?
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-           let iconImage = NSImage(contentsOf: iconURL) {
-            NSApp.applicationIconImage = iconImage
-        }
-        NSApp.activate(ignoringOtherApps: true)
-
-        let args = CommandLine.arguments.dropFirst()
-        if let firstPDF = args.first(where: { $0.lowercased().hasSuffix(".pdf") }) {
-            let url = URL(fileURLWithPath: firstPDF)
-            if FileManager.default.fileExists(atPath: url.path) {
-                viewModel?.loadPDF(from: url)
-            }
-        }
-    }
-
-    func application(_ application: NSApplication, open urls: [URL]) {
-        if let pdfURL = urls.first(where: { $0.pathExtension.lowercased() == "pdf" }) {
-            viewModel?.loadPDF(from: pdfURL)
-        }
-    }
-
-    /// 应用已在运行时被再次激活（点 Dock 图标、Finder 里再双击图标、或「用本应用打开文件」）。
-    /// 明确返回 false 表示「由我们自己处理，不要走默认行为」——
-    /// SwiftUI 的默认行为是在这类事件中新建窗口，正是历史上「莫名其妙多出一个窗口」的来源。
-    /// 这里统一改为：把已有窗口提到最前，绝不新建。
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        // 只在「主窗口」上做处理：排除「关于」面板，也排除 AppKit/SwiftUI 内部的
-        // 隐藏辅助窗口（输入法候选窗、提示气泡等）。
-        let mainWindow = sender.windows.first {
-            $0 !== AboutWindow.panel && ($0.isVisible || $0.isMiniaturized)
-        }
-        if let window = mainWindow {
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
-        }
-        sender.activate(ignoringOtherApps: false)
-        return false
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
-    }
-}
-
 // MARK: - 关于面板
 
 /// 应用元信息：集中定义作者与仓库信息，便于统一维护
@@ -1132,7 +1081,7 @@ private struct AboutView: View {
 /// 「关于」窗口的创建与复用
 @MainActor
 enum AboutWindow {
-    private(set) static var panel: NSWindow?
+    private static var panel: NSWindow?
 
     static func show() {
         if panel == nil {
@@ -1152,156 +1101,376 @@ enum AboutWindow {
     }
 }
 
+// MARK: - App 代理
+//
+// 多窗口下的打开文件规则（本文件里最重要的一段逻辑）：
+//
+//   1. 「应用已在运行 + 双击 PDF」 → 新开一个窗口放这个文件。
+//   2. 「双击 PDF 启动应用」 → 文件放进应用启动时建出的那个空白窗口，
+//      而不是再开一个（否则每次双击都会多出一个空窗口）。
+//   3. 「点 Dock 图标重新激活」 → 只把已有窗口提到最前，绝不新建。
+//
+// 第 2 条存在时序竞态：application(_:open:) 可能在第一个窗口出现之前就被调用。
+// 因此这里用「待打开队列 + 短时重试 + 窗口就绪回调」三重保险兜住它。
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// 退出时把「还开着的窗口」记在这里，下次启动恢复
+    static let restorationKey = "SimplePDFReader.restorableWindowPaths"
+
+    /// 已收到、但还没能分配到窗口的文件
+    private var pendingURLs: [URL] = []
+    private var pendingRetries = 0
+    private let maxPendingRetries = 60
+    private var restoreWorkItem: DispatchWorkItem?
+    /// 是否已经收到过「打开文件」事件。
+    /// application(_:open:) 与 applicationDidFinishLaunching 的先后顺序并不固定，
+    /// 因此不能靠「取消定时器」来互斥，必须用一个与顺序无关的状态来判断。
+    private var receivedOpenEvent = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let iconImage = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = iconImage
+        }
+        NSApp.activate(ignoringOtherApps: true)
+
+        // 命令行参数（开发调试：SimplePDFReader /path/to.pdf）
+        let argumentURLs = CommandLine.arguments.dropFirst()
+            .filter { $0.lowercased().hasSuffix(".pdf") }
+            .map { URL(fileURLWithPath: $0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+
+        if argumentURLs.isEmpty {
+            scheduleRestoration()
+        } else {
+            enqueue(argumentURLs)
+        }
+    }
+
+    /// 系统要求本应用打开若干文件（Finder 双击、拖到 Dock 图标、open -a 等）
+    func application(_ application: NSApplication, open urls: [URL]) {
+        // 明确要打开文件时，取消「恢复上次窗口」——
+        // 否则会既恢复一堆旧窗口、又打开新文件，用户会看到意料之外的窗口。
+        receivedOpenEvent = true
+        cancelRestoration()
+        enqueue(urls)
+    }
+
+    /// 应用已在运行时被再次激活（点 Dock 图标、在 Finder 里双击应用本身）。
+    /// 返回 false：明确告诉 AppKit「已由我们自己处理，不要走默认的建窗行为」。
+    /// 这里只把已有窗口提到最前 —— 绝不新建窗口。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        WindowRegistry.shared.bringMostRecentToFront()
+        sender.activate(ignoringOtherApps: false)
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        saveRestorationSnapshot()
+    }
+
+    /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上
+    func windowDidBecomeReady() {
+        drainPending()
+    }
+
+    // MARK: 待打开文件的分配
+
+    private func enqueue(_ urls: [URL]) {
+        let pdfs = urls.filter { $0.pathExtension.lowercased() == "pdf" }
+        guard !pdfs.isEmpty else { return }
+        pendingURLs.append(contentsOf: pdfs)
+        pendingRetries = 0
+        drainPending()
+    }
+
+    private func drainPending() {
+        // 1) 优先塞进「已就绪但还没有文档」的窗口（应用刚启动时的空白窗口属于这一类）
+        while !pendingURLs.isEmpty, let session = WindowRegistry.shared.claimEmptySession() {
+            let url = pendingURLs.removeFirst()
+            session.viewModel.loadPDF(from: url, silently: true)
+            session.window?.makeKeyAndOrderFront(nil)
+        }
+        guard !pendingURLs.isEmpty else {
+            pendingRetries = 0
+            return
+        }
+
+        // 2) 一个窗口都还没出现（双击文件启动时的时序竞态）→ 稍等窗口出现
+        if WindowRegistry.shared.isEmpty && pendingRetries < maxPendingRetries {
+            pendingRetries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.drainPending()
+            }
+            return
+        }
+
+        // 3) 否则为每个文件新开一个窗口
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        pendingRetries = 0
+        for url in urls {
+            ReaderWindowManager.shared.open(fileURL: url)
+        }
+    }
+
+    // MARK: 窗口状态恢复
+    //
+    // 用自己保存的路径列表恢复，而不是依赖 SwiftUI 的窗口恢复机制 ——
+    // 后者会在启动时凭空恢复出一堆窗口，正是历史上那类「莫名其妙多出窗口」的来源。
+
+    private func scheduleRestoration() {
+        // 本次启动是「双击文件」触发的 → 用户要的是那个文件，不是上次的一堆窗口
+        guard !receivedOpenEvent, pendingURLs.isEmpty else { return }
+
+        let keepsWindows = (UserDefaults.standard.object(forKey: "NSQuitAlwaysKeepsWindows") as? Bool) ?? true
+        guard keepsWindows else { return }
+
+        let paths = UserDefaults.standard.stringArray(forKey: Self.restorationKey) ?? []
+        guard !paths.isEmpty else { return }
+
+        // 留一个很短的宽限期：若这期间收到「打开文件」事件，就放弃恢复
+        // （用户双击文件时想要的是那个文件，而不是上次的一堆窗口）。
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            // 宽限期内如果收到了打开文件的事件，就放弃恢复
+            guard !self.receivedOpenEvent, self.pendingURLs.isEmpty else { return }
+            let urls = paths
+                .map { URL(fileURLWithPath: $0) }
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+            guard !urls.isEmpty else { return }
+            self.enqueue(urls)
+        }
+        restoreWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func cancelRestoration() {
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+    }
+
+    private func saveRestorationSnapshot() {
+        let keepsWindows = (UserDefaults.standard.object(forKey: "NSQuitAlwaysKeepsWindows") as? Bool) ?? true
+        let paths = keepsWindows
+            ? ReaderWindowManager.shared.openFileURLs.map { $0.path }
+            : []
+        UserDefaults.standard.set(paths, forKey: Self.restorationKey)
+    }
+}
+
 @main
 struct SimplePDFReaderApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var viewModel = PDFReaderViewModel()
-
-    /// 窗口标题：随打开的文档变化。刻意不再把它作为 Scene 的标题参数传入 ——
-    /// 场景标题应当保持稳定，动态内容交给 navigationTitle 更可靠。
-    private var windowTitle: String {
-        viewModel.primaryDocument == nil
-            ? AppMetadata.displayName
-            : "\(AppMetadata.displayName) — \(viewModel.primaryFileName)"
-    }
 
     var body: some Scene {
-        // 必须是 Window 而不是 WindowGroup。
+        // 这里用 Window 而不是 WindowGroup，是有实测依据的：
+        // SwiftUI 的 WindowGroup 会在每次收到「打开文件」事件时额外凭空创建一个窗口，
+        // 导致「双击一个 PDF」变成两个窗口。Window 不会。
         //
-        // WindowGroup 允许同一份 App 存在多个窗口，而本 App 只有一份 viewModel、
-        // 每个分屏只持有一个 PDFView 引用。一旦出现第二个窗口，两个窗口会争抢同一个
-        // pane.pdfView，导致操作（缩放、跳页）只作用到其中一个窗口，另一个窗口表现为
-        // 「放大缩小完全无效」「点页码不跳转」。
-        //
-        // 触发第二个窗口的真实路径：应用已在运行时，从 Finder 双击 PDF（或任何
-        // 「用本应用打开文件」的动作）—— SwiftUI 的 WindowGroup 会据此新建窗口。
-        // 换成 Window 后，窗口实例全局唯一，从结构上杜绝该问题。
+        // 多窗口本身完全支持 —— 除这一个之外的窗口全部由 ReaderWindowManager
+        // 用 NSWindow 显式创建，新建/复用的时机由我们自己掌握，可预测、可测试。
         Window(AppMetadata.displayName, id: "main") {
-            ContentView(viewModel: viewModel)
-                .navigationTitle(windowTitle)
-                .onAppear {
-                    appDelegate.viewModel = viewModel
-                }
+            PrimaryReaderWindow()
         }
         .commands {
-            // 用自定义「关于」面板替换系统默认的 About 项，展示作者与仓库信息
-            CommandGroup(replacing: .appInfo) {
-                Button("关于 \(AppMetadata.displayName)") {
-                    AboutWindow.show()
+            ReaderCommands()
+        }
+    }
+}
+
+// MARK: - 应用启动时的第一个阅读器窗口
+struct PrimaryReaderWindow: View {
+    @StateObject private var viewModel = PDFReaderViewModel()
+    @State private var sessionID = UUID()
+
+    var body: some View {
+        ReaderWindowView(viewModel: viewModel, sessionID: sessionID)
+            .navigationTitle(
+                viewModel.primaryDocument == nil
+                    ? AppMetadata.displayName
+                    : viewModel.primaryFileName
+            )
+    }
+}
+
+// MARK: - 阅读器窗口内容
+//
+// 每个窗口各持有一份 PDFReaderViewModel —— 这就是「多窗口互不干扰」的根本。
+// 文档、缩放、页码、侧栏、分屏、搜索全部是窗口私有状态。
+// 唯一被所有窗口共享的只有 AppSettings（应用级设置）与 DocumentStore（文档缓存）。
+//
+// 本视图同时被两种宿主使用：SwiftUI 的 Window 场景（主窗口）与
+// NSHostingController + NSWindow（ReaderWindowManager 创建的额外窗口）。
+// 因此这里只放内容，标题由各自的宿主设置。
+struct ReaderWindowView: View {
+    @ObservedObject var viewModel: PDFReaderViewModel
+    let sessionID: UUID
+
+    var body: some View {
+        ContentView(viewModel: viewModel)
+            .background(WindowAccessor { window in
+                Task { @MainActor in
+                    WindowRegistry.shared.attach(
+                        window: window,
+                        sessionID: sessionID,
+                        viewModel: viewModel
+                    )
+                }
+            })
+    }
+}
+
+// MARK: - 菜单命令
+//
+// 所有与阅读相关的命令都在**触发时**通过 WindowRegistry.shared.activeSession
+// 解析出「当前激活窗口」的 ViewModel，因此天然只作用于当前窗口。
+struct ReaderCommands: Commands {
+    /// 当前激活窗口的 ViewModel（触发时解析，不缓存）
+    private var reader: PDFReaderViewModel? {
+        WindowRegistry.shared.activeSession?.viewModel
+    }
+
+    var body: some Commands {
+        // 用自定义「关于」面板替换系统默认的 About 项，展示作者与仓库信息
+        CommandGroup(replacing: .appInfo) {
+            Button("关于 \(AppMetadata.displayName)") {
+                AboutWindow.show()
+            }
+        }
+
+        // 应用级动作：与具体窗口无关
+        CommandGroup(after: .appInfo) {
+            Divider()
+            Button("设为默认 PDF 阅读器…") {
+                AppSettings.shared.setAsDefaultPDFReader()
+            }
+        }
+
+        CommandGroup(replacing: .newItem) {
+            Button("新建窗口") {
+                ReaderWindowManager.shared.open()
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+
+            Button("在新窗口打开 PDF…") {
+                if let url = PDFOpenPanel.choose(title: "选择要在新窗口中打开的 PDF") {
+                    ReaderWindowManager.shared.open(fileURL: url)
                 }
             }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
 
-            // 在左上角应用主菜单 (SimplePDFReader) 中加入“设为默认 PDF 阅读器…”
-            CommandGroup(after: .appInfo) {
-                Divider()
-                Button("设为默认 PDF 阅读器…") {
-                    viewModel.setAsDefaultPDFReader()
-                }
+            Divider()
+
+            Button("在当前窗口打开 PDF…") {
+                reader?.openDocumentPanel()
             }
+            .keyboardShortcut("o", modifiers: [.command])
 
-            // 在“文件”菜单中也提供“设为默认 PDF 阅读器…”入口
-            CommandGroup(replacing: .newItem) {
-                Button("打开 PDF 文件…") {
-                    viewModel.openDocumentPanel()
-                }
-                .keyboardShortcut("o", modifiers: [.command])
+            Divider()
 
-                Divider()
-
-                Button("设为默认 PDF 阅读器…") {
-                    viewModel.setAsDefaultPDFReader()
-                }
+            Button("设为默认 PDF 阅读器…") {
+                AppSettings.shared.setAsDefaultPDFReader()
             }
+        }
 
-            CommandMenu("视图与缩放") {
-                Button("放大") {
-                    viewModel.zoomIn()
-                }
-                .keyboardShortcut("=", modifiers: [.command])
-
-                Button("缩小") {
-                    viewModel.zoomOut()
-                }
-                .keyboardShortcut("-", modifiers: [.command])
-
-                Button("实际大小 (100%)") {
-                    viewModel.resetZoomToActualSize()
-                }
-                .keyboardShortcut("0", modifiers: [.command])
-
-                Button("自适应宽度") {
-                    viewModel.zoomToFit()
-                }
-                .keyboardShortcut("9", modifiers: [.command])
-
-                Divider()
-
-                Button("显示/隐藏侧边栏") {
-                    viewModel.toggleSidebar()
-                }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-
-                Divider()
-
-                Button("单屏模式（默认）") {
-                    viewModel.layoutMode = .single
-                }
-                .keyboardShortcut("1", modifiers: [.command])
-
-                Button("双屏模式") {
-                    viewModel.layoutMode = .dual
-                }
-                .keyboardShortcut("2", modifiers: [.command])
-
-                Button("三屏模式") {
-                    viewModel.layoutMode = .triple
-                }
-                .keyboardShortcut("3", modifiers: [.command])
-
-                Button("四屏模式") {
-                    viewModel.layoutMode = .quad
-                }
-                .keyboardShortcut("4", modifiers: [.command])
-
-                Button("自适应分屏模式") {
-                    viewModel.layoutMode = .autoByZoom
-                }
-                .keyboardShortcut("5", modifiers: [.command])
+        CommandMenu("视图与缩放") {
+            Button("放大") {
+                reader?.zoomIn()
             }
+            .keyboardShortcut("=", modifiers: [.command])
 
-            CommandMenu("查找与跳转") {
-                Button("搜索全文…") {
-                    viewModel.focusSearchTrigger = UUID()
-                }
-                .keyboardShortcut("f", modifiers: [.command])
-
-                Button("查找下一个") {
-                    viewModel.selectNextSearchResult()
-                }
-                .keyboardShortcut("g", modifiers: [.command])
-
-                Button("查找上一个") {
-                    viewModel.selectPreviousSearchResult()
-                }
-                .keyboardShortcut("g", modifiers: [.command, .shift])
-
-                Divider()
-
-                Button("跳转到页码…") {
-                    viewModel.focusPageJumpTrigger = UUID()
-                }
-                .keyboardShortcut("j", modifiers: [.command])
-
-                Button("上一页") {
-                    viewModel.goToPreviousPage()
-                }
-                .keyboardShortcut(.upArrow, modifiers: [.command])
-
-                Button("下一页") {
-                    viewModel.goToNextPage()
-                }
-                .keyboardShortcut(.downArrow, modifiers: [.command])
+            Button("缩小") {
+                reader?.zoomOut()
             }
+            .keyboardShortcut("-", modifiers: [.command])
+
+            Button("实际大小 (100%)") {
+                reader?.resetZoomToActualSize()
+            }
+            .keyboardShortcut("0", modifiers: [.command])
+
+            Button("自适应宽度") {
+                reader?.zoomToFit()
+            }
+            .keyboardShortcut("9", modifiers: [.command])
+
+            Divider()
+
+            Button("显示/隐藏侧边栏") {
+                reader?.toggleSidebar()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+
+            Divider()
+
+            Button("单屏模式（默认）") {
+                reader?.layoutMode = .single
+            }
+            .keyboardShortcut("1", modifiers: [.command])
+
+            Button("双屏模式") {
+                reader?.layoutMode = .dual
+            }
+            .keyboardShortcut("2", modifiers: [.command])
+
+            Button("三屏模式") {
+                reader?.layoutMode = .triple
+            }
+            .keyboardShortcut("3", modifiers: [.command])
+
+            Button("四屏模式") {
+                reader?.layoutMode = .quad
+            }
+            .keyboardShortcut("4", modifiers: [.command])
+
+            Button("自适应分屏模式") {
+                reader?.layoutMode = .autoByZoom
+            }
+            .keyboardShortcut("5", modifiers: [.command])
+        }
+
+        CommandMenu("查找与跳转") {
+            Button("搜索全文…") {
+                reader?.focusSearchTrigger = UUID()
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+
+            Button("查找下一个") {
+                reader?.selectNextSearchResult()
+            }
+            .keyboardShortcut("g", modifiers: [.command])
+
+            Button("查找上一个") {
+                reader?.selectPreviousSearchResult()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+
+            Divider()
+
+            Button("跳转到页码…") {
+                reader?.focusPageJumpTrigger = UUID()
+            }
+            .keyboardShortcut("j", modifiers: [.command])
+
+            Button("上一页") {
+                reader?.goToPreviousPage()
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command])
+
+            Button("下一页") {
+                reader?.goToNextPage()
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command])
         }
     }
 }

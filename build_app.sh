@@ -136,6 +136,7 @@ swiftc -O -parse-as-library \
     -target arm64-apple-macosx13.0 \
     -sdk "$(xcrun --show-sdk-path)" \
     "$SCRIPT_DIR/Sources/SimplePDFReader/ModelsAndViewModel.swift" \
+    "$SCRIPT_DIR/Sources/SimplePDFReader/WindowSupport.swift" \
     "$SCRIPT_DIR/Sources/SimplePDFReader/AppAndViews.swift" \
     -framework SwiftUI -framework AppKit -framework PDFKit -framework UniformTypeIdentifiers \
     -o "$MACOS_DIR/SimplePDFReader"
