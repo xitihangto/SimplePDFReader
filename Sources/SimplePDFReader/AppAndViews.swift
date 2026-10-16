@@ -552,6 +552,9 @@ struct SidebarView: View {
 // MARK: - 主窗口内容视图（统一弹出式分屏菜单 + 响应式工具栏）
 struct ContentView: View {
     @ObservedObject var viewModel: PDFReaderViewModel
+    /// 应用级设置（全应用唯一一份）：窗口模式等。每个窗口都观察同一实例，
+    /// 因此任何窗口里切换窗口模式，所有窗口的工具栏按钮会同步更新。
+    @ObservedObject private var appSettings = AppSettings.shared
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPageJumpFocused: Bool
     @State private var toolbarWidth: CGFloat = 860
@@ -637,6 +640,22 @@ struct ContentView: View {
                         }
                     }
                     .help("打开 PDF 文件 (⌘O) · 未打开则在新窗口打开，已打开则切到那个窗口")
+
+                    // 窗口模式切换：单窗口（全局只保留一个窗口）/ 多窗口（每个新 PDF 各开一窗）。
+                    // 这是应用级设置，任何窗口按下去的切换都以「本窗口」为准。
+                    Button(action: {
+                        WindowModeController.shared.toggle(fromWindowOf: viewModel)
+                    }) {
+                        if isWideToolbar {
+                            Label(appSettings.windowMode.rawValue,
+                                  systemImage: appSettings.windowMode.symbolName)
+                        } else {
+                            Image(systemName: appSettings.windowMode.symbolName)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(appSettings.windowMode == .single ? .accentColor : nil)
+                    .help("当前：\(appSettings.windowMode.rawValue)模式 · 点击切换到\(appSettings.windowMode.toggled.rawValue)模式。\n单窗口模式全局只保留一个窗口（双击/工具栏/菜单打开都不再新开）；多窗口模式下未打开过的 PDF 会各开一个新窗口")
                 }
                 .fixedSize()
 
@@ -914,9 +933,12 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .help("关闭本文档（不关闭窗口，也不影响其他窗口）⌥⌘W")
-        // 多屏模式下每个分屏顶部有一条状态栏，按钮要落在它下面，避免压住「换文件」等按钮
+        // 与右侧垂直滚动条保持距离：PDFView 的垂直滚动条占据阅读区右缘约 11~15pt
+        // （叠加式 / 经典式宽度不同），按钮从前只留 10pt，圆边正好压在滚动条上。
+        // 现留出 30pt，按钮右缘与滚动条左缘之间至少还有 15pt 净距，两种样式都不会再碰。
+        // 多屏模式下每个分屏顶部有一条状态栏，按钮还要落在它下面，避免压住「换文件」等按钮
         .padding(.top, viewModel.visiblePaneCount > 1 ? 34 : 8)
-        .padding(.trailing, 10)
+        .padding(.trailing, 30)
     }
 
     // MARK: - 主阅读区（支持 1 / 2 / 3 / 4 分屏与空状态）
@@ -1138,7 +1160,8 @@ enum AboutWindow {
 //
 // 多窗口下的打开文件规则（本文件里最重要的一段逻辑）：
 //
-//   1. 「应用已在运行 + 双击 PDF」 → 该文件没开着就新开一个窗口放它；
+//   1. 「应用已在运行 + 双击 PDF」 → 该文件没开着就新开一个窗口放它
+//      （单窗口模式下则就地填入那唯一的窗口）；
 //      已经开着（含作为某个分屏的对比文档）则聚焦那个窗口，不重复打开。
 //   2. 「双击 PDF 启动应用」 → 文件放进应用启动时建出的那个空白窗口，
 //      而不是再开一个（否则每次双击都会多出一个空窗口）。
@@ -1147,22 +1170,17 @@ enum AboutWindow {
 // 具体怎么分配交给 ReaderWindowManager.openDocument 统一决策，
 // 这样「双击 PDF」「拖到 Dock」「工具栏打开按钮」「菜单打开」四处行为完全一致。
 //
+// 启动时不恢复上次的窗口：应用启动后永远只呈现一个空白主窗口，
+// 打开哪个文件由用户自己决定（这是用户明确要求的行为）。
+//
 // 第 2 条存在时序竞态：application(_:open:) 可能在第一个窗口出现之前就被调用。
 // 因此这里用「待打开队列 + 短时重试 + 窗口就绪回调」三重保险兜住它。
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// 退出时把「还开着的窗口」记在这里，下次启动恢复
-    static let restorationKey = "SimplePDFReader.restorableWindowPaths"
-
     /// 已收到、但还没能分配到窗口的文件
     private var pendingURLs: [URL] = []
     private var pendingRetries = 0
     private let maxPendingRetries = 60
-    private var restoreWorkItem: DispatchWorkItem?
-    /// 是否已经收到过「打开文件」事件。
-    /// application(_:open:) 与 applicationDidFinishLaunching 的先后顺序并不固定，
-    /// 因此不能靠「取消定时器」来互斥，必须用一个与顺序无关的状态来判断。
-    private var receivedOpenEvent = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -1178,19 +1196,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
 
-        if argumentURLs.isEmpty {
-            scheduleRestoration()
-        } else {
+        // 无参启动 → 一个空白主窗口（由 SwiftUI 的 Window 场景提供），
+        // 刻意不恢复上次打开的文档：打开什么由用户自行选择。
+        if !argumentURLs.isEmpty {
             enqueue(argumentURLs)
         }
     }
 
     /// 系统要求本应用打开若干文件（Finder 双击、拖到 Dock 图标、open -a 等）
     func application(_ application: NSApplication, open urls: [URL]) {
-        // 明确要打开文件时，取消「恢复上次窗口」——
-        // 否则会既恢复一堆旧窗口、又打开新文件，用户会看到意料之外的窗口。
-        receivedOpenEvent = true
-        cancelRestoration()
         enqueue(urls)
     }
 
@@ -1209,10 +1223,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         true
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        saveRestorationSnapshot()
     }
 
     /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上
@@ -1248,57 +1258,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 交给统一的打开入口逐份处理。它会自己决定「填入空白窗口 / 聚焦已打开的窗口 /
-        // 新开窗口」，因此双击 PDF、拖到 Dock、命令行传参的行为完全一致。
+        // 新开窗口」（或单窗口模式下的「就地填充」），因此双击 PDF、拖到 Dock、
+        // 命令行传参的行为完全一致。
         let urls = pendingURLs
         pendingURLs.removeAll()
         pendingRetries = 0
         for url in urls {
             ReaderWindowManager.shared.openDocument(at: url)
         }
-    }
-
-    // MARK: 窗口状态恢复
-    //
-    // 用自己保存的路径列表恢复，而不是依赖 SwiftUI 的窗口恢复机制 ——
-    // 后者会在启动时凭空恢复出一堆窗口，正是历史上那类「莫名其妙多出窗口」的来源。
-
-    private func scheduleRestoration() {
-        // 本次启动是「双击文件」触发的 → 用户要的是那个文件，不是上次的一堆窗口
-        guard !receivedOpenEvent, pendingURLs.isEmpty else { return }
-
-        let keepsWindows = (UserDefaults.standard.object(forKey: "NSQuitAlwaysKeepsWindows") as? Bool) ?? true
-        guard keepsWindows else { return }
-
-        let paths = UserDefaults.standard.stringArray(forKey: Self.restorationKey) ?? []
-        guard !paths.isEmpty else { return }
-
-        // 留一个很短的宽限期：若这期间收到「打开文件」事件，就放弃恢复
-        // （用户双击文件时想要的是那个文件，而不是上次的一堆窗口）。
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            // 宽限期内如果收到了打开文件的事件，就放弃恢复
-            guard !self.receivedOpenEvent, self.pendingURLs.isEmpty else { return }
-            let urls = paths
-                .map { URL(fileURLWithPath: $0) }
-                .filter { FileManager.default.fileExists(atPath: $0.path) }
-            guard !urls.isEmpty else { return }
-            self.enqueue(urls)
-        }
-        restoreWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
-    }
-
-    private func cancelRestoration() {
-        restoreWorkItem?.cancel()
-        restoreWorkItem = nil
-    }
-
-    private func saveRestorationSnapshot() {
-        let keepsWindows = (UserDefaults.standard.object(forKey: "NSQuitAlwaysKeepsWindows") as? Bool) ?? true
-        let paths = keepsWindows
-            ? ReaderWindowManager.shared.openFileURLs.map { $0.path }
-            : []
-        UserDefaults.standard.set(paths, forKey: Self.restorationKey)
     }
 }
 
@@ -1395,6 +1362,15 @@ struct ReaderCommands: Commands {
                 ReaderWindowManager.shared.openNewWindow()
             }
             .keyboardShortcut("n", modifiers: [.command])
+
+            // 与工具栏的窗口模式按钮同一条逻辑：按当前实际模式决定切到哪边。
+            // 标题刻意不随模式变化 —— Commands 的重建时机不可依赖，
+            // 与其显示一个可能过时的模式名，不如用一个固定的准确描述。
+            Button("切换窗口模式（单窗口 / 多窗口）") {
+                if let viewModel = WindowRegistry.shared.activeSession?.viewModel {
+                    WindowModeController.shared.toggle(fromWindowOf: viewModel)
+                }
+            }
 
             // 与「在 Finder 里双击 PDF」完全同一条路径：
             // 没开着就新开窗口，已经开着就聚焦已有窗口，本窗口空着就地填入。

@@ -4,6 +4,33 @@ import PDFKit
 import Combine
 import UniformTypeIdentifiers
 
+// MARK: - 窗口模式（应用级设置）
+//
+// 「开着几个窗口」不是某个窗口的私事，而是整个应用的运行方式，
+// 因此它和「设为默认阅读器」一样属于应用级状态，放 AppSettings 里。
+//
+//   · .single 单窗口 —— 全局只允许一个窗口（v1.2.0 的行为）：
+//     无论双击 PDF、工具栏打开还是菜单打开，都只往那唯一的窗口里填，绝不新开；
+//   · .multi 多窗口 —— 每个没打开过的 PDF 都各开一个新窗口（v1.4.0 的行为）。
+enum WindowMode: String, CaseIterable, Identifiable {
+    case single = "单窗口"
+    case multi = "多窗口"
+
+    var id: String { rawValue }
+
+    var symbolName: String {
+        switch self {
+        case .single: return "rectangle"
+        case .multi: return "square.grid.2x2"
+        }
+    }
+
+    /// 切换到另一种模式
+    var toggled: WindowMode {
+        self == .single ? .multi : .single
+    }
+}
+
 // MARK: - 应用级设置（全应用唯一一份）
 //
 // 多窗口架构下的状态分层原则：
@@ -20,7 +47,22 @@ import UniformTypeIdentifiers
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
-    private init() {}
+    /// 窗口模式写入 UserDefaults 的 key
+    private static let windowModeKey = "SimplePDFReader.windowMode"
+
+    private init() {
+        // 默认多窗口：与 v1.3.0 以来的默认行为一致，用户可随时在工具栏切换
+        let raw = UserDefaults.standard.string(forKey: Self.windowModeKey) ?? WindowMode.multi.rawValue
+        windowMode = WindowMode(rawValue: raw) ?? .multi
+    }
+
+    /// 当前窗口模式（单窗口 / 多窗口）。任何窗口的工具栏按钮都能改它，
+    /// 且改动对所有窗口立即生效 —— 这正是它必须是「应用级」的原因。
+    @Published var windowMode: WindowMode {
+        didSet {
+            UserDefaults.standard.set(windowMode.rawValue, forKey: Self.windowModeKey)
+        }
+    }
 
     /// 把本应用设为系统默认的 PDF 打开程序。
     /// 设置一次即对整个系统生效，因此天然属于「应用级」动作。
@@ -61,6 +103,78 @@ final class AppSettings: ObservableObject {
         alert.alertStyle = style
         alert.addButton(withTitle: "好的")
         alert.runModal()
+    }
+}
+
+// MARK: - 窗口模式的切换与执行
+//
+// 单窗口 / 多窗口的切换涉及「关闭别的窗口」这种不可逆动作，因此单独放在一个
+// 应用级控制器里，而不是塞进某个窗口的 ViewModel —— 后者在多窗口下会出现
+// 「到底以哪个窗口为准」的问题。
+//
+// 切换规则：
+//   · 多窗口 → 单窗口：要关掉其他窗口，先弹窗确认；确认后**只保留发起切换的
+//     那个窗口**，其余全部关闭；
+//   · 单窗口 → 多窗口：没有窗口会被关闭，立即生效，无需确认。
+@MainActor
+final class WindowModeController {
+    static let shared = WindowModeController()
+
+    private init() {}
+
+    /// 在两种窗口模式间切换（工具栏按钮 / 菜单项调用）。
+    /// - Parameter viewModel: 发起切换的那个窗口的 ViewModel。
+    ///   从多窗口切到单窗口时，**这个窗口会被保留**，其他窗口全部关闭。
+    func toggle(fromWindowOf viewModel: PDFReaderViewModel) {
+        if AppSettings.shared.windowMode == .single {
+            // 单窗口 → 多窗口：不关任何窗口，直接生效
+            AppSettings.shared.windowMode = .multi
+            return
+        }
+
+        // 多窗口 → 单窗口：会关掉其他窗口，必须先问一句。
+        // 只有一个窗口时没什么可关的，免掉弹窗直接切换。
+        let otherCount = WindowRegistry.shared.liveSessions.filter { $0.viewModel !== viewModel }.count
+        guard otherCount > 0 else {
+            AppSettings.shared.windowMode = .single
+            return
+        }
+
+        // 弹窗挂在发起切换的窗口上；拿不到窗口就不弹，直接切换。
+        guard let window = WindowRegistry.shared.session(owning: viewModel)?.window else {
+            AppSettings.shared.windowMode = .single
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "仅保留本窗口，其他窗口关闭并切换到单窗口模式"
+        alert.informativeText = "当前共有 \(otherCount + 1) 个窗口。切换到单窗口模式后，只有按下切换按钮的这个窗口会保留，其余 \(otherCount) 个窗口将被关闭。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "切换到单窗口")
+        alert.addButton(withTitle: "取消")
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            Task { @MainActor in
+                guard response == .alertFirstButtonReturn else { return }
+                self?.switchToSingle(keeping: viewModel)
+            }
+        }
+    }
+
+    /// 确认后真正执行「切到单窗口」：设置模式 + 关闭除 keeper 之外的所有窗口。
+    func switchToSingle(keeping viewModel: PDFReaderViewModel) {
+        AppSettings.shared.windowMode = .single
+
+        // keeper 拿不到会话时兜底为最近活跃的窗口，避免把全部窗口都关掉导致应用退出
+        let keeper = WindowRegistry.shared.session(owning: viewModel)
+            ?? WindowRegistry.shared.mostRecentSession
+        for session in WindowRegistry.shared.liveSessions where session.id != keeper?.id {
+            session.window?.close()
+        }
+        if let window = keeper?.window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: false)
+        }
     }
 }
 
@@ -299,55 +413,77 @@ final class ReaderWindowManager {
 
     /// 新建一个阅读器窗口（菜单「文件 → 新建窗口」⌘N）。
     ///
-    /// 用户明确要的是「一个新窗口」，所以即便此刻已经有一个空白窗口，也照样再开一个，
-    /// 不做复用 —— 复用会让 ⌘N 看起来「没反应」。
+    /// 单窗口模式下不允许新开：此时 ⌘N 只会把已有窗口提到最前（带文件则填入），
+    /// 与「全局只允许一个窗口」的约束一致。
+    ///
+    /// 多窗口模式下用户明确要的是「一个新窗口」，所以即便此刻已经有一个空白窗口，
+    /// 也照样再开一个，不做复用 —— 复用会让 ⌘N 看起来「没反应」。
     @discardableResult
-    func openNewWindow(fileURL: URL? = nil) -> UUID {
-        create(fileURL: fileURL)
+    func openNewWindow(fileURL: URL? = nil) -> UUID? {
+        if AppSettings.shared.windowMode == .single {
+            if let fileURL {
+                openDocument(at: fileURL)
+            } else {
+                WindowRegistry.shared.bringMostRecentToFront()
+            }
+            return nil
+        }
+        return create(fileURL: fileURL)
     }
 
     /// 统一的「打开文件」入口 —— 双击 PDF、拖到 Dock、工具栏「打开」按钮、
     /// 菜单「打开 PDF…」全部走这里，因此行为完全一致。
     ///
-    /// 规则（按优先级）：
+    /// 两种模式共用第一条：该文件已在某个窗口打开 → 聚焦那个窗口，不重复打开。
+    ///
+    /// 单窗口模式（v1.2.0 行为）：除此之外永远只往那唯一的窗口里填 ——
+    /// 窗口空着就填入，有内容就替换，**绝不新开窗口**。
+    ///
+    /// 多窗口模式的规则（按优先级）：
     ///   1. 该文件已在某个窗口打开 → 聚焦那个窗口，**绝不重复打开同一份文件**；
     ///   2. 发起操作的那个窗口本身是空的 → 就地填入（这是「填入」而不是「顶掉」，
     ///      所以不会出现「点开一个文件，原来那个空窗口还空着」的浪费）；
     ///   3. 还有别的空白窗口 → 装进最近用过的那个；
     ///   4. 否则 → 新开一个窗口承载它。
     ///
-    /// 关键在于第 4 条：**已经开着的内容永远不会被顶掉**，需要时自动多开一个窗口。
-    /// 这正是「多窗口对比阅读」的用法。
+    /// 关键在于多窗口模式的第 4 条：**已经开着的内容永远不会被顶掉**，需要时自动
+    /// 多开一个窗口。这正是「多窗口对比阅读」的用法。
     func openDocument(at url: URL, preferring window: NSWindow? = nil) {
         let key = url.standardizedFileURL
 
-        // 1) 已经打开 → 聚焦，不重复打开
+        // 1) 已经打开 → 聚焦，不重复打开（两种模式通用）
         if let existing = WindowRegistry.shared.session(displaying: key) {
             focus(existing.window)
             return
         }
 
-        // 2) 发起操作的窗口是空的 → 就地填入
+        // 2) 单窗口模式：全局只允许一个窗口，任何「打开」都只是填那唯一的窗口
+        if AppSettings.shared.windowMode == .single {
+            if let session = WindowRegistry.shared.mostRecentSession {
+                session.viewModel.loadPDF(from: key, silently: true)
+                focus(session.window)
+                return
+            }
+            create(fileURL: key)
+            return
+        }
+
+        // 3) 发起操作的窗口是空的 → 就地填入
         if let origin = WindowRegistry.shared.session(for: window), !origin.hasDocument {
             origin.viewModel.loadPDF(from: key, silently: true)
             focus(origin.window)
             return
         }
 
-        // 3) 任意一个空白窗口
+        // 4) 任意一个空白窗口
         if let empty = WindowRegistry.shared.claimEmptySession() {
             empty.viewModel.loadPDF(from: key, silently: true)
             focus(empty.window)
             return
         }
 
-        // 4) 新开一个窗口
+        // 5) 新开一个窗口
         create(fileURL: key)
-    }
-
-    /// 当前所有窗口正在查看的文件（用于退出时保存、下次启动恢复）
-    var openFileURLs: [URL] {
-        WindowRegistry.shared.liveSessions.compactMap { $0.viewModel.primaryFileURL }
     }
 
     // MARK: 内部
