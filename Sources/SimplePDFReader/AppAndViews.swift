@@ -1255,9 +1255,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 串行化：同一轮引导进行中时，后续窗口就绪不再触发，避免叠出两个 sheet。
     private var firstLaunchPromptActive = false
 
+    /// 等窗口可见的重试计数：SwiftUI Window 场景的窗口在负载高时可能迟迟不上屏，
+    /// 而入场时 UserDefaults 标记已经落下 —— 一旦放弃，第①问就再也不会出现。
+    /// 因此这里隔一小段时间重试，而不是 silently give up。
+    private var firstLaunchRetries = 0
+    private static let maxFirstLaunchRetries = 20   // 20 × 0.3s ≈ 6s
+
     private func promptFirstLaunchIfNeeded(on window: NSWindow) {
         guard !firstLaunchPromptActive else { return }
-        guard window.isVisible else { return }
 
         if UserDefaults.standard.bool(forKey: Self.hasPromptedDefaultReaderKey) {
             // 上次启动问完第①问就退出了：补问第②问
@@ -1265,13 +1270,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         firstLaunchPromptActive = true
+        firstLaunchRetries = 0
         // 进场即落标记：哪怕用户在弹窗出现前就杀掉了应用，也不该再问第二次
         UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
 
-        // 等窗口动画与布局稳定再挂 sheet，否则 sheet 可能挂到还没就位的窗口上
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            guard self != nil, window.isVisible else {
-                self?.firstLaunchPromptActive = false
+        // 等窗口动画与布局稳定再挂 sheet，否则 sheet 可能挂到还没就位的窗口上；
+        // 窗口还没上屏就隔 0.3s 再试（最多约 6s），绝不静默放弃。
+        scheduleSheetOne(on: window)
+    }
+
+    private func scheduleSheetOne(on window: NSWindow) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (firstLaunchRetries == 0 ? 0.6 : 0.3)) { [weak self] in
+            guard let self else { return }
+            if !window.isVisible {
+                if firstLaunchRetries < Self.maxFirstLaunchRetries {
+                    firstLaunchRetries += 1
+                    scheduleSheetOne(on: window)
+                } else {
+                    firstLaunchPromptActive = false
+                }
                 return
             }
 
@@ -1293,7 +1310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 首次启动的第②问：习惯哪种窗口模式。两个按钮点哪个就设哪种模式，
+    /// 首次启动的第②问：习惯哪种窗口模式。两个按钮点哪个即设哪种模式，
     /// 同样终身只问一次。按钮顺序与程序默认值一致（多窗口在前）。
     private func promptWindowModeIfNeeded(on window: NSWindow) {
         guard !UserDefaults.standard.bool(forKey: Self.hasPromptedWindowModeKey) else {
@@ -1301,12 +1318,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         firstLaunchPromptActive = true
+        firstLaunchRetries = 0
         UserDefaults.standard.set(true, forKey: Self.hasPromptedWindowModeKey)
 
-        // 第①问的 sheet 刚收，留一拍让窗口回到可交互状态
+        // 第①问的 sheet 刚收，留一拍让窗口回到可交互状态；
+        // 与第①问相同：窗口不可见就重试，不静默放弃。
+        scheduleSheetTwo(on: window)
+    }
+
+    private func scheduleSheetTwo(on window: NSWindow) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard self != nil, window.isVisible else {
-                self?.firstLaunchPromptActive = false
+            guard let self else { return }
+            if !window.isVisible {
+                if firstLaunchRetries < Self.maxFirstLaunchRetries {
+                    firstLaunchRetries += 1
+                    scheduleSheetTwo(on: window)
+                } else {
+                    firstLaunchPromptActive = false
+                }
                 return
             }
 
@@ -1323,7 +1352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.beginSheetModal(for: window) { response in
                 Task { @MainActor in
                     AppSettings.shared.windowMode = (response == .alertFirstButtonReturn) ? .multi : .single
-                    self?.firstLaunchPromptActive = false
+                    self.firstLaunchPromptActive = false
                 }
             }
         }
