@@ -17,18 +17,6 @@ enum WindowMode: String, CaseIterable, Identifiable {
     case multi = "多窗口"
 
     var id: String { rawValue }
-
-    var symbolName: String {
-        switch self {
-        case .single: return "rectangle"
-        case .multi: return "square.grid.2x2"
-        }
-    }
-
-    /// 切换到另一种模式
-    var toggled: WindowMode {
-        self == .single ? .multi : .single
-    }
 }
 
 // MARK: - 应用级设置（全应用唯一一份）
@@ -193,6 +181,32 @@ enum WindowTitles {
     }
 }
 
+// MARK: - 「窗口模式」菜单勾选同步
+//
+// 菜单（ReaderCommands 里的 CommandMenu("窗口模式")）用 SwiftUI Toggle 呈现两个选项，
+// 勾选状态来自 AppSettings.windowMode。但实测：模式被**菜单之外**的路径改变时
+// （例如首次启动的 sheet 里选了单窗口），SwiftUI 不保证立刻刷新对应 NSMenuItem 的
+// state —— 勾选会停在旧模式上。因此这里在每次 windowMode 变化时显式校正一次。
+@MainActor
+enum WindowModeMenuSync {
+    private static let menuTitle = "窗口模式"
+    private static let multiItemTitle = "多窗口"
+    private static let singleItemTitle = "单窗口模式"
+
+    static func refresh() {
+        guard let menuItem = NSApp.mainMenu?.items.first(where: { $0.title == menuTitle }),
+              let submenu = menuItem.submenu else { return }
+        let mode = AppSettings.shared.windowMode
+        for item in submenu.items {
+            switch item.title {
+            case multiItemTitle: item.state = (mode == .multi) ? .on : .off
+            case singleItemTitle: item.state = (mode == .single) ? .on : .off
+            default: break
+            }
+        }
+    }
+}
+
 // MARK: - 选择 PDF 的系统面板
 @MainActor
 enum PDFOpenPanel {
@@ -270,7 +284,7 @@ final class WindowRegistry {
         // NSApp.delegate —— 那里是 SwiftUI 的内部代理对象（委托方法会被转发，
         // 所以 application(_:open:) 等回调一切正常，但强转永远得到 nil）。
         // 这条链历史上因此静默失效过，靠 drainPending 的重试定时器兜底。
-        AppDelegate.current?.windowDidBecomeReady()
+        AppDelegate.current?.windowDidBecomeReady(for: window)
 
         sweepDocuments()
     }

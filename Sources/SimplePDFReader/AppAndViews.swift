@@ -2,6 +2,7 @@ import SwiftUI
 import PDFKit
 import AppKit
 import UniformTypeIdentifiers
+import Combine
 
 // MARK: - 宽度监听 PreferenceKey（用于工具栏自适应缩放）
 private struct ToolbarWidthPreferenceKey: PreferenceKey {
@@ -552,9 +553,6 @@ struct SidebarView: View {
 // MARK: - 主窗口内容视图（统一弹出式分屏菜单 + 响应式工具栏）
 struct ContentView: View {
     @ObservedObject var viewModel: PDFReaderViewModel
-    /// 应用级设置（全应用唯一一份）：窗口模式等。每个窗口都观察同一实例，
-    /// 因此任何窗口里切换窗口模式，所有窗口的工具栏按钮会同步更新。
-    @ObservedObject private var appSettings = AppSettings.shared
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPageJumpFocused: Bool
     @State private var toolbarWidth: CGFloat = 860
@@ -640,22 +638,6 @@ struct ContentView: View {
                         }
                     }
                     .help("打开 PDF 文件 (⌘O) · 未打开则在新窗口打开，已打开则切到那个窗口")
-
-                    // 窗口模式切换：单窗口（全局只保留一个窗口）/ 多窗口（每个新 PDF 各开一窗）。
-                    // 这是应用级设置，任何窗口按下去的切换都以「本窗口」为准。
-                    Button(action: {
-                        WindowModeController.shared.toggle(fromWindowOf: viewModel)
-                    }) {
-                        if isWideToolbar {
-                            Label(appSettings.windowMode.rawValue,
-                                  systemImage: appSettings.windowMode.symbolName)
-                        } else {
-                            Image(systemName: appSettings.windowMode.symbolName)
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(appSettings.windowMode == .single ? .accentColor : nil)
-                    .help("当前：\(appSettings.windowMode.rawValue)模式 · 点击切换到\(appSettings.windowMode.toggled.rawValue)模式。\n单窗口模式全局只保留一个窗口（双击/工具栏/菜单打开都不再新开）；多窗口模式下未打开过的 PDF 会各开一个新窗口")
                 }
                 .fixedSize()
 
@@ -1195,10 +1177,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingRetries = 0
     private let maxPendingRetries = 60
 
+    /// Combine 订阅（如「窗口模式」菜单勾选同步）
+    private var cancellables = Set<AnyCancellable>()
+
     /// 「是否设为默认 PDF 阅读器」是否已经问过。终身只问一次，
     /// 且两个按钮（设为默认 / 以后再说）都算问过 —— 用户明确选了「以后再说」
     /// 还反复打扰，那不是「仅提示一次」。
     private static let hasPromptedDefaultReaderKey = "SimplePDFReader.hasPromptedDefaultReader"
+
+    /// 「习惯哪种窗口模式」是否已经问过。同样终身只问一次，
+    /// 两个按钮（多窗口 / 单窗口）都算问过。
+    private static let hasPromptedWindowModeKey = "SimplePDFReader.hasPromptedWindowMode"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -1207,6 +1196,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = iconImage
         }
         NSApp.activate(ignoringOtherApps: true)
+
+        // 「窗口模式」菜单勾选显式同步：模式在菜单之外被改变时（如首启动 sheet 作答），
+        // SwiftUI 的 Toggle 菜单项不保证及时刷新 NSMenuItem.state，这里兜底。
+        AppSettings.shared.$windowMode
+            .receive(on: RunLoop.main)
+            .sink { _ in WindowModeMenuSync.refresh() }
+            .store(in: &cancellables)
 
         // 命令行参数（开发调试：SimplePDFReader /path/to.pdf）
         let argumentURLs = CommandLine.arguments.dropFirst()
@@ -1243,26 +1239,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上
-    func windowDidBecomeReady() {
-        promptSetAsDefaultIfNeeded()
+    /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上，
+    /// 并承担「首次启动引导」的触发点。
+    func windowDidBecomeReady(for window: NSWindow) {
+        promptFirstLaunchIfNeeded(on: window)
         drainPending()
     }
 
-    /// 首次启动、第一个窗口就绪后，询问是否设为默认 PDF 阅读器。终身只问一次。
+    /// 首次启动的引导问题，依次两问：
+    /// ① 是否设为默认 PDF 阅读器；② 习惯哪种窗口模式（多窗口 / 单窗口）。
     ///
-    /// 挂在当前窗口上以 sheet 形式呈现（而不是 app 模态框）：它以建议的姿态出现，
-    /// 不该挡住用户此刻正在做的事。无论用户怎么选都不再提示。
-    private func promptSetAsDefaultIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: Self.hasPromptedDefaultReaderKey) else { return }
+    /// 各问都终身只出现一次（任何选择都算问过，进场即落 UserDefaults 标记），
+    /// 且**第一个问题关闭后才问第二个**—— 一次只一件事，不叠 sheet。
+    /// windowDidBecomeReady 对每个新窗口都会触发，故用 firstLaunchPromptActive
+    /// 串行化：同一轮引导进行中时，后续窗口就绪不再触发，避免叠出两个 sheet。
+    private var firstLaunchPromptActive = false
+
+    private func promptFirstLaunchIfNeeded(on window: NSWindow) {
+        guard !firstLaunchPromptActive else { return }
+        guard window.isVisible else { return }
+
+        if UserDefaults.standard.bool(forKey: Self.hasPromptedDefaultReaderKey) {
+            // 上次启动问完第①问就退出了：补问第②问
+            promptWindowModeIfNeeded(on: window)
+            return
+        }
+        firstLaunchPromptActive = true
         // 进场即落标记：哪怕用户在弹窗出现前就杀掉了应用，也不该再问第二次
         UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
 
         // 等窗口动画与布局稳定再挂 sheet，否则 sheet 可能挂到还没就位的窗口上
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            guard self != nil,
-                  let window = NSApp.keyWindow ?? WindowRegistry.shared.liveSessions.first?.window
-            else { return }
+            guard self != nil, window.isVisible else {
+                self?.firstLaunchPromptActive = false
+                return
+            }
 
             let alert = NSAlert()
             alert.messageText = "是否将 SimplePDFReader 设为默认 PDF 阅读器？"
@@ -1270,11 +1281,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.alertStyle = .informational
             alert.addButton(withTitle: "设为默认")
             alert.addButton(withTitle: "以后再说")
-            alert.beginSheetModal(for: window) { response in
+            alert.beginSheetModal(for: window) { [weak self] response in
                 Task { @MainActor in
                     if response == .alertFirstButtonReturn {
                         AppSettings.shared.setAsDefaultPDFReader()
                     }
+                }
+                // 第①问关闭（无论怎么选）→ 接着问第②问
+                self?.promptWindowModeIfNeeded(on: window)
+            }
+        }
+    }
+
+    /// 首次启动的第②问：习惯哪种窗口模式。两个按钮点哪个就设哪种模式，
+    /// 同样终身只问一次。按钮顺序与程序默认值一致（多窗口在前）。
+    private func promptWindowModeIfNeeded(on window: NSWindow) {
+        guard !UserDefaults.standard.bool(forKey: Self.hasPromptedWindowModeKey) else {
+            firstLaunchPromptActive = false
+            return
+        }
+        firstLaunchPromptActive = true
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedWindowModeKey)
+
+        // 第①问的 sheet 刚收，留一拍让窗口回到可交互状态
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard self != nil, window.isVisible else {
+                self?.firstLaunchPromptActive = false
+                return
+            }
+
+            let alert = NSAlert()
+            alert.messageText = "习惯使用哪种窗口模式？"
+            alert.informativeText = """
+                多窗口模式：允许应用同时持有多个窗口实例，可在多个窗口并排阅读不同文档，适合对照阅读；
+                单窗口模式：全局仅保留一个窗口实例，所有打开操作都只作用于该窗口，适合专注单份文档。
+                之后可随时在顶部菜单栏「窗口模式」中更改。
+                """
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "多窗口")
+            alert.addButton(withTitle: "单窗口")
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in
+                    AppSettings.shared.windowMode = (response == .alertFirstButtonReturn) ? .multi : .single
+                    self?.firstLaunchPromptActive = false
                 }
             }
         }
@@ -1395,6 +1444,10 @@ struct ReaderCommands: Commands {
         WindowRegistry.shared.activeSession?.viewModel
     }
 
+    /// 窗口模式是应用级设置，菜单里的勾选要实时跟随它（任何窗口切换模式后
+    /// 勾选都要立即搬家），因此这里直接观察 AppSettings.shared。
+    @ObservedObject private var appSettings = AppSettings.shared
+
     var body: some Commands {
         // 用自定义「关于」面板替换系统默认的 About 项，展示作者与仓库信息
         CommandGroup(replacing: .appInfo) {
@@ -1416,15 +1469,6 @@ struct ReaderCommands: Commands {
                 ReaderWindowManager.shared.openNewWindow()
             }
             .keyboardShortcut("n", modifiers: [.command])
-
-            // 与工具栏的窗口模式按钮同一条逻辑：按当前实际模式决定切到哪边。
-            // 标题刻意不随模式变化 —— Commands 的重建时机不可依赖，
-            // 与其显示一个可能过时的模式名，不如用一个固定的准确描述。
-            Button("切换窗口模式（单窗口 / 多窗口）") {
-                if let viewModel = WindowRegistry.shared.activeSession?.viewModel {
-                    WindowModeController.shared.toggle(fromWindowOf: viewModel)
-                }
-            }
 
             // 与「在 Finder 里双击 PDF」完全同一条路径：
             // 没开着就新开窗口，已经开着就聚焦已有窗口，本窗口空着就地填入。
@@ -1450,6 +1494,22 @@ struct ReaderCommands: Commands {
             Button("设为默认 PDF 阅读器…") {
                 AppSettings.shared.setAsDefaultPDFReader()
             }
+        }
+
+        // 顶级「窗口模式」菜单：多窗口 / 单窗口，当前生效者带勾。
+        // 勾选状态来自 appSettings.windowMode（应用级设置），因此无论是
+        // 在哪里切的模式，打开这个菜单看到的勾都永远在实际生效的那一项上。
+        CommandMenu("窗口模式") {
+            Toggle("多窗口", isOn: Binding(
+                get: { appSettings.windowMode == .multi },
+                // 点已勾选项会传入 false，忽略即可（不允许「两个都不勾」）
+                set: { if $0 { AppSettings.shared.windowMode = .multi } }
+            ))
+
+            Toggle("单窗口模式", isOn: Binding(
+                get: { appSettings.windowMode == .single },
+                set: { if $0 { AppSettings.shared.windowMode = .single } }
+            ))
         }
 
         CommandMenu("视图与缩放") {
