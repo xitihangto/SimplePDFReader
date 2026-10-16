@@ -178,6 +178,21 @@ final class WindowModeController {
     }
 }
 
+// MARK: - 窗口标题
+//
+// 标题 =「本窗口的文档（或应用名）（当前窗口模式）」。
+// 模式是应用级设置，因此标题既要跟随本窗口的文档变化，也要跟随全局模式变化 ——
+// 任何窗口切换模式后，所有窗口（含空白窗口）的标题都会立即刷新。
+@MainActor
+enum WindowTitles {
+    static func title(primaryFileName: String?, hasDocument: Bool, mode: WindowMode) -> String {
+        let base = hasDocument
+            ? (primaryFileName ?? "未命名文档")
+            : AppMetadata.displayName
+        return "\(base)（\(mode.rawValue)）"
+    }
+}
+
 // MARK: - 选择 PDF 的系统面板
 @MainActor
 enum PDFOpenPanel {
@@ -249,7 +264,13 @@ final class WindowRegistry {
         observe(window: window, sessionID: sessionID)
 
         // 新窗口就绪：立刻看看有没有「等窗口出现才能打开」的文件
-        (NSApp.delegate as? AppDelegate)?.windowDidBecomeReady()
+        //
+        // 注意：必须走 AppDelegate.current，不能写 (NSApp.delegate as? AppDelegate)。
+        // SwiftUI 的 @NSApplicationDelegateAdaptor 并不会把 AppDelegate 对象挂到
+        // NSApp.delegate —— 那里是 SwiftUI 的内部代理对象（委托方法会被转发，
+        // 所以 application(_:open:) 等回调一切正常，但强转永远得到 nil）。
+        // 这条链历史上因此静默失效过，靠 drainPending 的重试定时器兜底。
+        AppDelegate.current?.windowDidBecomeReady()
 
         sweepDocuments()
     }
@@ -502,19 +523,31 @@ final class ReaderWindowManager {
         window.minSize = NSSize(width: 420, height: 380)
         // 由本类负责释放时机，避免 AppKit 在关闭时自动释放造成悬垂引用
         window.isReleasedWhenClosed = false
-        window.title = Self.title(for: viewModel)
+        window.title = WindowTitles.title(
+            primaryFileName: viewModel.primaryFileName,
+            hasDocument: viewModel.primaryDocument != nil,
+            mode: AppSettings.shared.windowMode
+        )
         window.center()
 
         windows[sessionID] = window
 
-        // 标题跟随本窗口的文档。macOS 惯例是「窗口标题 = 文档名」，
-        // 多窗口时用户正是靠它区分哪个窗口是哪份文件。
-        titleObservers[sessionID] = viewModel.$primaryFileName
-            .combineLatest(viewModel.$primaryDocument)
-            .receive(on: RunLoop.main)
-            .sink { [weak window] name, document in
-                window?.title = document == nil ? AppMetadata.displayName : name
-            }
+        // 标题 = 本窗口文档 + 当前窗口模式（见 WindowTitles）。
+        // 模式是应用级设置：任何窗口切换模式，全部窗口的标题都要跟着变，
+        // 因此把 AppSettings.$windowMode 也并进这条发布链。
+        titleObservers[sessionID] = Publishers.CombineLatest3(
+            viewModel.$primaryFileName,
+            viewModel.$primaryDocument,
+            AppSettings.shared.$windowMode
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak window] name, document, mode in
+            window?.title = WindowTitles.title(
+                primaryFileName: name,
+                hasDocument: document != nil,
+                mode: mode
+            )
+        }
 
         closeObservers[sessionID] = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
@@ -542,10 +575,6 @@ final class ReaderWindowManager {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: false)
-    }
-
-    static func title(for viewModel: PDFReaderViewModel) -> String {
-        viewModel.primaryDocument == nil ? AppMetadata.displayName : viewModel.primaryFileName
     }
 }
 

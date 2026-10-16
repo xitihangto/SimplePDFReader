@@ -297,12 +297,6 @@ final class PDFReaderViewModel: ObservableObject {
         ReaderWindowManager.shared.openDocument(at: url, preferring: originWindow)
     }
 
-    /// 菜单「在当前窗口打开 PDF…」：明确替换**本窗口**当前文档，不开新窗口。
-    func openDocumentPanelReplacingCurrent() {
-        guard let url = PDFOpenPanel.choose(title: "选择要打开的 PDF 文件") else { return }
-        loadPDF(from: url)
-    }
-
     /// 「换文件」按钮：为某个分屏单独打开一份对比 PDF（只影响该分屏）。
     func openDocumentPanel(forPaneIndex paneIndex: Int) {
         let title = "为分屏 #\(paneIndex + 1) 选择 PDF 文件"

@@ -1,5 +1,34 @@
 # 版本更新记录 (Changelog)
 
+## [v1.6.0] - 2026-10-16
+
+### 变更：菜单精简 —— 移除「在当前窗口打开 PDF…」（⌥⌘O）
+
+窗口行为既然完全由「单窗口 / 多窗口」模式决定（单窗口下所有打开入口都只填那唯一的窗口，多窗口下对已打开的文档直接聚焦对应窗口），「替换当前文档」这个入口便显多余。文件菜单中该菜单项、快捷键 `⌥⌘O` 及对应代码路径（`openDocumentPanelReplacingCurrent`）一并移除。把 PDF **拖进某个窗口**仍是明确的指向性操作，仍按「替换本窗口文档」处理，不受影响。
+
+### 新特性：窗口标题栏实时显示当前模式
+
+- 空白窗口标题为「SimplePDFReader（多窗口 / 单窗口）」；
+- 打开文档后为「文件名（多窗口 / 单窗口）」；
+- 切换模式时，**所有窗口**（含空白窗口）的标题立即同步刷新，与实际模式始终一致。
+
+实现上把应用级设置 `AppSettings.$windowMode` 并入标题发布链（`CombineLatest3(primaryFileName, primaryDocument, windowMode)`），因此任何窗口切换模式，全部窗口标题都会跟着变。
+
+### 新特性：初次安装询问「是否设为默认 PDF 阅读器」，仅提示一次
+
+首次启动、第一个主窗口就绪后即以 sheet 形式询问：「是否将 SimplePDFReader 设为默认 PDF 阅读器？」（带文件启动时同样会询问 —— 首次就是首次）。点「设为默认」立即绑定为系统默认 `.pdf` 应用；点「以后再说」或按 `Escape` 关闭。**无论怎么选都不再提示**（进场即落 UserDefaults 标记），之后仍可随时通过菜单「文件 → 设为默认 PDF 阅读器…」或应用菜单同名入口绑定。
+
+### 修复：窗口就绪回调曾静默失效（`NSApp.delegate` 强转为 nil）
+
+SwiftUI 的 `@NSApplicationDelegateAdaptor` **不会**把 `AppDelegate` 对象挂到 `NSApp.delegate` —— 那里是 SwiftUI 的内部代理对象（委托方法会被正常转发，所以 `application(_:open:)` 等回调一切照旧，但 `NSApp.delegate as? AppDelegate` 永远得到 `nil`）。此前 `WindowRegistry.attach()` 中「新窗口就绪 → `windowDidBecomeReady`」走的正是这条强转链，因此从未被触发（一直被 `drainPending` 的重试定时器兜底掩盖，未暴露症状）。现改为 `AppDelegate.current` 自存引用（`init` 中赋值），「窗口就绪 → 首提示 / 待打开文件排空」链路恢复正常。这也是本次首提示功能在初版实现后不弹出的真实根因。
+
+### 验证方式
+
+- **首提示一次性**：诊断版冷启动，A 阶段即命中 `hasPromptedDefaultReader=true`，sheet 截图确认文案与「以后再说 / 设为默认」两个按钮；关闭后再不再出现。
+- **菜单 dump** 确认「在当前窗口打开 PDF…」已消失，其余菜单项完好。
+- **标题序列全程正确**：`SimplePDFReader（多窗口）` → `sample1.pdf（多窗口）` →（切单窗口后）`sample2.pdf（单窗口）` →（切回多窗口）`sample2.pdf（多窗口）`。
+- **模式切换全流程回归**：三窗口确认切换只保留发起窗口、取消无副作用、单窗口就地替换、切回多窗口立即生效，全部通过。
+
 ## [v1.5.0] - 2026-10-16
 
 ### 修复：启动后默认打开上次的 PDF → 改为空白初始界面

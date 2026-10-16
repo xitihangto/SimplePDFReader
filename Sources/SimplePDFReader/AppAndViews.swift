@@ -1177,10 +1177,28 @@ enum AboutWindow {
 // 因此这里用「待打开队列 + 短时重试 + 窗口就绪回调」三重保险兜住它。
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// 全局唯一的 AppDelegate 引用。
+    ///
+    /// 为什么需要它：SwiftUI 的 `@NSApplicationDelegateAdaptor` 并不会把本对象挂到
+    /// `NSApp.delegate`（那里是 SwiftUI 的内部代理，委托方法虽会被转发，但
+    /// `NSApp.delegate as? AppDelegate` 永远得到 nil）。`WindowRegistry` 要在
+    /// 「新窗口就绪」时回调本对象，因此这里自存一份引用。
+    static var current: AppDelegate?
+
+    override init() {
+        super.init()
+        Self.current = self
+    }
+
     /// 已收到、但还没能分配到窗口的文件
     private var pendingURLs: [URL] = []
     private var pendingRetries = 0
     private let maxPendingRetries = 60
+
+    /// 「是否设为默认 PDF 阅读器」是否已经问过。终身只问一次，
+    /// 且两个按钮（设为默认 / 以后再说）都算问过 —— 用户明确选了「以后再说」
+    /// 还反复打扰，那不是「仅提示一次」。
+    private static let hasPromptedDefaultReaderKey = "SimplePDFReader.hasPromptedDefaultReader"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -1227,7 +1245,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 由 WindowRegistry 在某个窗口就绪时回调，用来把「等窗口」的文件补上
     func windowDidBecomeReady() {
+        promptSetAsDefaultIfNeeded()
         drainPending()
+    }
+
+    /// 首次启动、第一个窗口就绪后，询问是否设为默认 PDF 阅读器。终身只问一次。
+    ///
+    /// 挂在当前窗口上以 sheet 形式呈现（而不是 app 模态框）：它以建议的姿态出现，
+    /// 不该挡住用户此刻正在做的事。无论用户怎么选都不再提示。
+    private func promptSetAsDefaultIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Self.hasPromptedDefaultReaderKey) else { return }
+        // 进场即落标记：哪怕用户在弹窗出现前就杀掉了应用，也不该再问第二次
+        UserDefaults.standard.set(true, forKey: Self.hasPromptedDefaultReaderKey)
+
+        // 等窗口动画与布局稳定再挂 sheet，否则 sheet 可能挂到还没就位的窗口上
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard self != nil,
+                  let window = NSApp.keyWindow ?? WindowRegistry.shared.liveSessions.first?.window
+            else { return }
+
+            let alert = NSAlert()
+            alert.messageText = "是否将 SimplePDFReader 设为默认 PDF 阅读器？"
+            alert.informativeText = "设为默认后，在 Finder 中双击 PDF 文件都会自动用 SimplePDFReader 打开。之后也可以在菜单「文件 → 设为默认 PDF 阅读器…」中随时更改。"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "设为默认")
+            alert.addButton(withTitle: "以后再说")
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in
+                    if response == .alertFirstButtonReturn {
+                        AppSettings.shared.setAsDefaultPDFReader()
+                    }
+                }
+            }
+        }
     }
 
     // MARK: 待打开文件的分配
@@ -1293,13 +1343,17 @@ struct SimplePDFReaderApp: App {
 struct PrimaryReaderWindow: View {
     @StateObject private var viewModel = PDFReaderViewModel()
     @State private var sessionID = UUID()
+    /// 标题要带当前窗口模式，而模式是应用级设置，故直接观察 AppSettings
+    @ObservedObject private var appSettings = AppSettings.shared
 
     var body: some View {
         ReaderWindowView(viewModel: viewModel, sessionID: sessionID)
             .navigationTitle(
-                viewModel.primaryDocument == nil
-                    ? AppMetadata.displayName
-                    : viewModel.primaryFileName
+                WindowTitles.title(
+                    primaryFileName: viewModel.primaryFileName,
+                    hasDocument: viewModel.primaryDocument != nil,
+                    mode: appSettings.windowMode
+                )
             )
     }
 }
@@ -1381,11 +1435,6 @@ struct ReaderCommands: Commands {
                 }
             }
             .keyboardShortcut("o", modifiers: [.command])
-
-            Button("在当前窗口打开 PDF…") {
-                reader?.openDocumentPanelReplacingCurrent()
-            }
-            .keyboardShortcut("o", modifiers: [.command, .option])
 
             Divider()
 
