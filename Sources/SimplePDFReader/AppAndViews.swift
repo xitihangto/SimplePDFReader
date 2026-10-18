@@ -4,6 +4,21 @@ import AppKit
 import UniformTypeIdentifiers
 import Combine
 
+// MARK: - 侧栏尺寸（唯一来源）
+//
+// 侧栏宽度与 HSplitView 分隔线宽度在这里各定义一次：
+//   · SidebarView 用它设置固定宽度；
+//   · 开/关侧栏时窗口按 `occupancy` 增减，保证「阅读区宽度不变」。
+// 两边同源，所以开→关必然回到原宽度，不会差 1pt 挤出横向滚动条。
+enum SidebarMetrics {
+    /// 侧栏内容宽度
+    static let width: CGFloat = 250
+    /// HSplitView 分隔线宽度（实测 1pt）
+    static let divider: CGFloat = 1
+    /// 侧栏展开时占用的总宽度
+    static var occupancy: CGFloat { width + divider }
+}
+
 // MARK: - 自定义 PDFView（支持点击激活分屏、实时监听缩放与拖拽打开 PDF）
 final class InteractivePDFView: PDFView {
     var onActivatePane: (() -> Void)?
@@ -512,7 +527,7 @@ struct SidebarView: View {
         // 之后插入时已存在 NSSplitView 会保留阅读区原宽，侧栏只拿到剩余 1pt（被 min 抬到 185）。
         // 于是首轮窗口 = 页宽+300，次轮 = 页宽+185，看起来「第一次特别宽」。
         // 钉成单一宽度后两个分支没有可分配的余地，首轮/次轮必然一致；代价是不能拖分隔线。
-        .frame(width: 250)
+        .frame(width: SidebarMetrics.width)
         .background(Color(NSColor.controlBackgroundColor))
     }
 
@@ -664,6 +679,7 @@ struct ContentView: View {
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPageJumpFocused: Bool
     @State private var windowWidth: CGFloat = 860
+    @State private var hostWindow: NSWindow?
 
     /// 缩放菜单里的固定档位（百分比）
     private static let zoomPresetPercents = [25, 50, 75, 100, 125, 150, 175, 200]
@@ -710,15 +726,11 @@ struct ContentView: View {
                 windowWidth = width
             }
         })
+        .background(WindowAccessor { window in
+            hostWindow = window
+        })
         .onChange(of: viewModel.showSidebar) { _ in
-            // 侧栏插入/移除会改变 HSplitView 的宽度分配，自己加减推算必然偏：
-            // 首轮拿不到实测宽度（兜底 225pt），加宽后 HSplitView 又把新增宽度分给侧栏，
-            // 阅读区拿不到应有宽度 → 出横向滚动条。
-            // 改为交给 PageFitSizer：它用「内容宽 − 视口宽」实测工具栏+侧栏占位并迭代纠正，
-            // 直到视口严格等于第一页 100%，加宽/收窄两个方向都成立。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                PageFitSizer.shared.scheduleFit(viewModel: viewModel)
-            }
+            adjustWindowWidthForSidebar()
         }
         .onChange(of: viewModel.focusSearchTrigger) { _ in
             if !showsInlineSearch {
@@ -956,6 +968,30 @@ struct ContentView: View {
                 if isOn { viewModel.smartZoomStrategy = strategy }
             }
         )
+    }
+
+    // MARK: - 侧边栏展开 / 收起时窗口同步加宽 / 收窄
+    //
+    // 语义：**在用户当前的窗口宽度上增减侧栏占位**，不重新计算「第一页 100%」。
+    // 用户把窗口拖到任意宽度后开侧栏，页面显示区宽度应当保持不变；关掉再原样退回。
+    // 若改成调 PageFitSizer，就会把窗口强行改回「页宽 + 侧栏」，用户手动调过的宽度被覆盖。
+    //
+    // 实现：展开时窗口 + `SidebarMetrics.occupancy`，收起时 - 同一个值。
+    // 因为侧栏是固定宽度、分隔线也是固定 1pt，这个值就是侧栏真实占用的宽度，
+    // 加多少减多少完全对称 —— 用户拖到任意宽度后开合，都会精确回到原宽度。
+    private func adjustWindowWidthForSidebar() {
+        guard let window = hostWindow ?? WindowPlacement.frontWindow(owning: viewModel) else { return }
+        let expanding = viewModel.showSidebar
+        // 等 HSplitView 完成一次布局再动窗口，避免和插入/移除抢同一帧
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            var frame = window.frame
+            let delta = expanding ? SidebarMetrics.occupancy : -SidebarMetrics.occupancy
+            let newWidth = max(frame.width + delta, window.minSize.width)
+            guard abs(newWidth - frame.width) > 0.5 else { return }
+            // 只改宽度、保持左上角不动
+            frame.size.width = newWidth
+            window.setFrame(frame, display: true)
+        }
     }
 
     // MARK: - 页码跳转组
