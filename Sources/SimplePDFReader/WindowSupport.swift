@@ -295,7 +295,10 @@ enum ZoomInputPanel {
         let state = ZoomInputState(currentPercent: currentPercent)
         let hosting = NSHostingController(rootView: ZoomInputView(state: state))
         let window = NSWindow(contentViewController: hosting)
-        window.styleMask = [.titled, .closable]
+        // 刻意不带 .closable：runModal 不会因为窗口被关掉而结束，
+        // 若保留红色关闭按钮，用户点一下就会留下「窗口没了、模态循环还在」的假死状态。
+        // 出口只有「确定 / 取消 / Esc」三个。
+        window.styleMask = [.titled]
         window.title = "自定义缩放"
         window.isReleasedWhenClosed = false
         state.window = window
