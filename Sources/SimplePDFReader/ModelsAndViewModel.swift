@@ -433,9 +433,15 @@ final class PDFReaderViewModel: ObservableObject {
     }
 
     // MARK: - 缩放控制 (放大 / 缩小 / 自适应宽度 / 实际大小)
-    /// PDFView 允许的缩放区间，与 PDFKitRepresentedView 中设置的 min/max 保持一致
-    static let minZoomScale: CGFloat = 0.25
-    static let maxZoomScale: CGFloat = 5.0
+    /// PDFView 允许的缩放区间，与 PDFKitRepresentedView 中设置的 min/max 保持一致。
+    /// 区间与「自定义缩放」弹窗的输入范围（10% ~ 1000%）严格一致，
+    /// 否则用户输入 10% 会被 PDFKit 静默夹回 25%，表现为「输入了但不生效」。
+    static let minZoomScale: CGFloat = 0.1
+    static let maxZoomScale: CGFloat = 10.0
+
+    /// 自定义缩放弹窗允许输入的百分比区间（整数）
+    static let minZoomPercent: Int = 10
+    static let maxZoomPercent: Int = 1000
 
     func zoomIn() {
         stepZoom(by: 1.15)
@@ -462,6 +468,11 @@ final class PDFReaderViewModel: ObservableObject {
 
     func resetZoomToActualSize() {
         applyZoomScale(1.0, toPaneIndex: activePaneIndex)
+    }
+
+    /// 按百分比设置当前分屏的缩放（工具栏缩放菜单的预设项与「自定义…」都走这里）
+    func zoom(toPercent percent: Int) {
+        applyZoomScale(CGFloat(percent) / 100.0, toPaneIndex: activePaneIndex)
     }
 
     func zoomToFit() {

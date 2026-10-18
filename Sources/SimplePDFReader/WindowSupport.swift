@@ -281,6 +281,226 @@ enum WindowPlacement {
     }
 }
 
+// MARK: - 自定义缩放比例面板
+//
+// 为什么不用 NSAlert：系统 alert 的 `runModal()` 内部会把自己重新按**屏幕**居中，
+// 无法保证「相对主窗口绝对居中」。这里自绘一个普通 NSWindow（app 级、非系统弹窗），
+// 复用 WindowPlacement.centerOnParent 的居中算法，与首启动面板、关于面板完全一致。
+@MainActor
+enum ZoomInputPanel {
+    /// 弹出面板并阻塞等待结果；用户取消或输入非法未确认时返回 nil。
+    static func present(currentPercent: Int, parent: NSWindow?) -> Int? {
+        guard let parent = parent ?? WindowPlacement.frontWindow() else { return nil }
+
+        let state = ZoomInputState(currentPercent: currentPercent)
+        let hosting = NSHostingController(rootView: ZoomInputView(state: state))
+        let window = NSWindow(contentViewController: hosting)
+        window.styleMask = [.titled, .closable]
+        window.title = "自定义缩放"
+        window.isReleasedWhenClosed = false
+        state.window = window
+
+        window.contentView?.layoutSubtreeIfNeeded()
+        WindowPlacement.centerOnParent(window, parent: parent)
+        window.makeKeyAndOrderFront(nil)
+        WindowPlacement.scheduleModalCentering(window, parent: parent)
+
+        NSApp.runModal(for: window)
+        window.orderOut(nil)
+        return state.result
+    }
+}
+
+@MainActor
+final class ZoomInputState: ObservableObject {
+    @Published var text: String
+    @Published var errorText: String?
+
+    var result: Int?
+    weak var window: NSWindow?
+
+    init(currentPercent: Int) {
+        self.text = "\(currentPercent)"
+    }
+
+    func confirm() {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let value = Int(trimmed),
+              value >= PDFReaderViewModel.minZoomPercent,
+              value <= PDFReaderViewModel.maxZoomPercent else {
+            errorText = "请输入 \(PDFReaderViewModel.minZoomPercent) – \(PDFReaderViewModel.maxZoomPercent) 之间的整数"
+            return
+        }
+        result = value
+        NSApp.stopModal(withCode: .OK)
+    }
+
+    func cancel() {
+        result = nil
+        NSApp.stopModal(withCode: .cancel)
+    }
+}
+
+private struct ZoomInputView: View {
+    @ObservedObject var state: ZoomInputState
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("自定义缩放比例")
+                .font(.system(size: 13, weight: .semibold))
+
+            Text("输入 \(PDFReaderViewModel.minZoomPercent) – \(PDFReaderViewModel.maxZoomPercent) 之间的整数，单位为百分比（无需输入 %）。")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 6) {
+                TextField("100", text: $state.text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13, design: .monospaced))
+                    .frame(width: 84)
+                    .focused($isFocused)
+                    .onSubmit { state.confirm() }
+
+                Text("%")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.secondary)
+
+                Spacer(minLength: 0)
+            }
+
+            // 固定占位，避免错误提示出现时把窗口内容顶出边界
+            Text(state.errorText ?? " ")
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
+                .frame(height: 13, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("取消") { state.cancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("确定") { state.confirm() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(width: 320)
+        .onAppear {
+            isFocused = true
+            // 模态会话启动后焦点可能被系统收走，再补一次
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { isFocused = true }
+        }
+    }
+}
+
+// MARK: - 打开文档后让视口严格等于「第一页 100%」
+//
+// 需求：无论从哪条路径打开 PDF，窗口都要以第一页 100% 显示，且**视口**
+// （PDF 显示区域，不含工具栏与滚动条）的宽高正好等于第一页的宽高。
+//
+// 实现要点：
+//   · 不用固定常数推算工具栏高度，而是「内容区尺寸 − 视口尺寸」实测出工具栏占位，
+//     否则差几个点就会出现「露出第二页一条边」或「底部一条白边」；
+//   · 系统若使用传统（非悬浮）滚动条，纵向滚动条会吃掉视口宽度，必须额外预留，
+//     否则内容宽度 = 视口宽度时会被挤出一条横向滚动条；
+//   · 改尺寸时保持窗口左上角不动，并夹取在屏幕可见区域内（大幅面 PDF 不可能整页放下）。
+@MainActor
+final class PageFitSizer {
+    static let shared = PageFitSizer()
+
+    private init() {}
+
+    /// 尺寸对齐的容差（pt）：小于它就不再纠正，避免来回抖动
+    private static let tolerance: CGFloat = 0.6
+
+    /// 文档刚载入时窗口与 PDFView 往往还没完成布局，因此带重试。
+    func scheduleFit(viewModel: PDFReaderViewModel) {
+        run(viewModel: viewModel, remainingAttempts: 10)
+    }
+
+    private func run(viewModel: PDFReaderViewModel, remainingAttempts: Int) {
+        let settled = fit(viewModel: viewModel)
+        guard !settled, remainingAttempts > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak viewModel] in
+            guard let viewModel else { return }
+            self.run(viewModel: viewModel, remainingAttempts: remainingAttempts - 1)
+        }
+    }
+
+    /// - Returns: true 表示已经对齐（或无需处理）
+    private func fit(viewModel: PDFReaderViewModel) -> Bool {
+        // 只有单屏才谈得上「视口 = 一页」；多屏模式下每屏宽度是窗口的 1/N，不做自动改尺寸
+        guard viewModel.layoutMode == .single,
+              let session = WindowRegistry.shared.session(owning: viewModel),
+              let window = session.window, window.isVisible,
+              let document = viewModel.primaryDocument, document.pageCount > 0,
+              let page = document.page(at: 0),
+              let pdfView = viewModel.panes[0].livePDFView,
+              let contentView = window.contentView
+        else { return false }
+
+        var box = page.bounds(for: .cropBox)
+        if box.width < 1 || box.height < 1 {
+            box = page.bounds(for: .mediaBox)
+        }
+        var pageWidth = box.width
+        var pageHeight = box.height
+        // 页面旋转 90° / 270° 时显示出来的宽高互换
+        if page.rotation % 180 != 0 {
+            swap(&pageWidth, &pageHeight)
+        }
+        guard pageWidth > 1, pageHeight > 1 else { return true }
+
+        contentView.layoutSubtreeIfNeeded()
+
+        let contentSize = contentView.bounds.size
+        let viewport = pdfView.convert(pdfView.bounds, to: nil)
+        guard viewport.width > 1, viewport.height > 1, contentSize.width > 1 else { return false }
+
+        // 视口之外的部分：工具栏 + 分割线（宽），工具栏 + 标题栏（高）
+        let chromeWidth = contentSize.width - viewport.width
+        let chromeHeight = contentSize.height - viewport.height
+        guard chromeWidth >= 0, chromeHeight >= 0 else { return false }
+
+        let scrollerWidth: CGFloat = NSScroller.preferredScrollerStyle == .legacy
+            ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+            : 0
+
+        var target = NSSize(width: ceil(pageWidth + scrollerWidth + chromeWidth),
+                            height: ceil(pageHeight + chromeHeight))
+
+        if let screen = window.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            target.width = min(target.width, visible.width)
+            target.height = min(target.height, visible.height)
+        }
+        target.width = max(target.width, window.minSize.width)
+        target.height = max(target.height, window.minSize.height)
+
+        let deltaWidth = target.width - contentSize.width
+        let deltaHeight = target.height - contentSize.height
+        guard abs(deltaWidth) > Self.tolerance || abs(deltaHeight) > Self.tolerance else { return true }
+
+        // 只改尺寸，保持左上角不动
+        var frame = window.frame
+        frame.size.width += deltaWidth
+        frame.size.height += deltaHeight
+        frame.origin.y -= deltaHeight
+
+        // 变高之后底边可能越出屏幕可见区域（大幅面 PDF 被夹取时），把整窗收回屏幕内
+        if let screen = window.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            frame.origin.x = min(max(frame.origin.x, visible.minX), max(visible.minX, visible.maxX - frame.width))
+            frame.origin.y = min(max(frame.origin.y, visible.minY), max(visible.minY, visible.maxY - frame.height))
+        }
+
+        window.setFrame(frame, display: true)
+        return false
+    }
+}
+
 // MARK: - 窗口模式的切换与执行
 //
 // 单窗口 / 多窗口的切换涉及「关闭别的窗口」这种不可逆动作，因此单独放在一个
@@ -861,6 +1081,62 @@ final class DocumentStore {
 }
 
 // MARK: - 把 SwiftUI 视图所在的原生窗口暴露出来
+// MARK: - 窗口内容宽度监听
+//
+// 为什么不能再用「工具栏自己的 GeometryReader」量宽度：
+// 工具栏内容溢出时，GeometryReader 报出的是**溢出后的宽度**，于是断点判断
+// 永远停留在宽屏档，形成「越挤越宽、越宽越挤」的死循环 ——
+// 表现为左侧按钮被推出窗口、右侧搜索框被裁掉。
+// 窗口内容宽度是唯一不受内容影响的权威口径，因此改由它来驱动断点。
+struct WindowWidthObserver: NSViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = WidthProbeView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let probe = nsView as? WidthProbeView else { return }
+        probe.onChange = onChange
+        probe.report()
+    }
+
+    final class WidthProbeView: NSView {
+        var onChange: ((CGFloat) -> Void)?
+        private var token: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let token {
+                NotificationCenter.default.removeObserver(token)
+            }
+            token = nil
+            guard let window = self.window else { return }
+            token = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                DispatchQueue.main.async { self?.report() }
+            }
+            report()
+        }
+
+        func report() {
+            guard let window = self.window else { return }
+            onChange?(window.contentLayoutRect.width)
+        }
+
+        deinit {
+            if let token {
+                NotificationCenter.default.removeObserver(token)
+            }
+        }
+    }
+}
+
 struct WindowAccessor: NSViewRepresentable {
     let onWindowReady: (NSWindow) -> Void
 

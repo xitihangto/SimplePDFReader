@@ -4,14 +4,6 @@ import AppKit
 import UniformTypeIdentifiers
 import Combine
 
-// MARK: - 宽度监听 PreferenceKey（用于工具栏自适应缩放）
-private struct ToolbarWidthPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 860
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
 // MARK: - 自定义 PDFView（支持点击激活分屏、实时监听缩放与拖拽打开 PDF）
 final class InteractivePDFView: PDFView {
     var onActivatePane: (() -> Void)?
@@ -43,7 +35,80 @@ final class InteractivePDFView: PDFView {
 
     override func scrollWheel(with event: NSEvent) {
         onActivatePane?()
+
+        // ⌘ + 滚轮 / ⌘ + 双指滑动 = 以光标为中心缩放。
+        // 不调用 super：否则同一串事件会既缩放又翻页。
+        //
+        // 判定同时看事件自带修饰键与「当前键盘状态」：部分输入设备/驱动合成的滚动事件
+        // 不会带上 modifiers，只看 event.modifierFlags 会漏判成普通翻页。
+        let commandHeld = event.modifierFlags.contains(.command)
+            || NSEvent.modifierFlags.contains(.command)
+        if commandHeld {
+            handleCommandScrollZoom(with: event)
+            return
+        }
+
         super.scrollWheel(with: event)
+    }
+
+    /// ⌘ + 滚轮缩放。
+    ///
+    /// 手感参数说明（两处常数就是全部可调项）：
+    ///   · 精确设备（触控板）：scrollingDeltaY 以「点」为单位，一次滑动通常 1~10 点；
+    ///   · 非精确设备（鼠标滚轮）：scrollingDeltaY 以「行」为单位，通常 ±1；
+    /// 两者量级差一个数量级，因此用两套底数，保证「滚一格」和「滑一下」的观感接近。
+    private func handleCommandScrollZoom(with event: NSEvent) {
+        // 惯性事件（松手后的滑行）不再继续缩放，否则会一路放大停不下来
+        guard event.momentumPhase.isEmpty else { return }
+        guard document != nil else { return }
+
+        let delta = event.scrollingDeltaY
+        guard abs(delta) > 0.0001 else { return }
+
+        let factor = event.hasPreciseScrollingDeltas
+            ? pow(1.0018, delta)
+            : pow(1.12, delta)
+        guard factor > 0, abs(factor - 1) > 0.00001 else { return }
+
+        zoomKeepingPointUnderCursor(by: factor,
+                                    at: convert(event.locationInWindow, from: nil))
+    }
+
+    /// 缩放并保持 `anchorInView` 处的内容不动（光标锚定）。
+    ///
+    /// 做法：缩放前记下锚点对应的页面坐标 → 改缩放 → 重新算出该页面坐标落在视图里的
+    /// 新位置 → 把内部滚动视图的偏移量反向补偿回去。
+    private func zoomKeepingPointUnderCursor(by factor: CGFloat, at anchorInView: NSPoint) {
+        guard let page = currentPage else { return }
+        let oldScale = scaleFactor
+        guard oldScale > 0 else { return }
+        let newScale = min(max(oldScale * factor, minScaleFactor), maxScaleFactor)
+        guard abs(newScale - oldScale) > 0.0001 else { return }
+
+        let anchorInPage = convert(anchorInView, to: page)
+
+        autoScales = false
+        scaleFactor = newScale
+        layoutDocumentView()
+
+        // 内部滚动视图拿不到时退化为「以中心缩放」（scaleFactor 已经生效，只是不锚定光标）
+        guard let clipView = documentView?.enclosingScrollView?.contentView else {
+            if scaleFactor > 0 { onScaleChanged?(scaleFactor) }
+            return
+        }
+
+        let newAnchorInView = convert(anchorInPage, from: page)
+        let dx = newAnchorInView.x - anchorInView.x
+        let dy = newAnchorInView.y - anchorInView.y
+        if abs(dx) > 0.5 || abs(dy) > 0.5 {
+            var origin = clipView.bounds.origin
+            origin.x += dx
+            origin.y += dy
+            clipView.scroll(to: origin)
+            documentView?.enclosingScrollView?.reflectScrolledClipView(clipView)
+        }
+
+        if scaleFactor > 0 { onScaleChanged?(scaleFactor) }
     }
 
     override func magnify(with event: NSEvent) {
@@ -97,6 +162,10 @@ struct PDFKitRepresentedView: NSViewRepresentable {
         // 表现为「切一次分屏，缩放比例自己变了一点」。
         pdfView.displayDirection = .vertical
         pdfView.displaysPageBreaks = true
+        // 分页留白只保留「底部 8pt」作为页间间隙：
+        //   · 上边距归零 —— 否则第一页顶部会多出一条白边，视口就不再「正好等于一页」；
+        //   · 左/右边距归零 —— 否则内容宽度 = 页宽 + 16pt，视口只有页宽时必然出现横向滚动条。
+        pdfView.pageBreakMargins = NSEdgeInsets(top: 0, left: 0, bottom: 8, right: 0)
         pdfView.backgroundColor = NSColor.windowBackgroundColor
         pdfView.minScaleFactor = PDFReaderViewModel.minZoomScale
         pdfView.maxScaleFactor = PDFReaderViewModel.maxZoomScale
@@ -555,28 +624,29 @@ struct ContentView: View {
     @ObservedObject var viewModel: PDFReaderViewModel
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPageJumpFocused: Bool
-    @State private var toolbarWidth: CGFloat = 860
+    @State private var windowWidth: CGFloat = 860
+
+    /// 缩放菜单里的固定档位（百分比）
+    private static let zoomPresetPercents = [25, 50, 75, 100, 125, 150, 175, 200]
 
     // 窗口宽度断点：
-    // - 宽屏 (>= 760pt)：完整显示按钮文字与内联搜索框
-    // - 中屏 (540 ~ 759pt)：图标化按钮 + 紧凑内联搜索框
-    // - 小窗 (< 540pt)：主栏精简，搜索框自动转为可展开的第二行抽屉栏
-    private var isWideToolbar: Bool { toolbarWidth >= 760 }
-    private var isCompactToolbar: Bool { toolbarWidth < 540 }
+    // - 宽屏 (>= 590pt)：显示按钮文字，搜索框收进右侧按钮（点开为第二行抽屉）
+    // - 中屏 (540 ~ 589pt)：按钮图标化，搜索框同样是按钮
+    // - 小窗 (< 540pt)：整体收紧
+    //
+    // 断点下移的原因：打开 PDF 后视口宽度现在严格等于页宽（A4 ≈ 595pt），
+    // 若沿用 760pt 的宽屏断点，页大小窗口里的工具栏会退化成一排纯图标。
+    // 但 595pt 放不下「文字 + 175pt 内联搜索框」，所以把两者拆成两个独立断点。
+    private var isWideToolbar: Bool { windowWidth >= 590 }
+    private var isCompactToolbar: Bool { windowWidth < 540 }
+    /// 内联搜索框（约 175pt）只在真正够宽的窗口里显示
+    private var showsInlineSearch: Bool { windowWidth >= 760 }
+    /// 宽屏用舒展间距，其余收紧，保证 595pt 下按钮文字不被裁切
+    private var toolbarSpacing: CGFloat { windowWidth >= 760 ? 10 : 6 }
 
     var body: some View {
         VStack(spacing: 0) {
             responsiveTopToolbar
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(key: ToolbarWidthPreferenceKey.self, value: geo.size.width)
-                    }
-                )
-                .onPreferenceChange(ToolbarWidthPreferenceKey.self) { newWidth in
-                    if abs(toolbarWidth - newWidth) > 1 {
-                        toolbarWidth = newWidth
-                    }
-                }
 
             Divider()
 
@@ -596,8 +666,13 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 400, minHeight: 360)
+        .background(WindowWidthObserver { width in
+            if abs(windowWidth - width) > 1 {
+                windowWidth = width
+            }
+        })
         .onChange(of: viewModel.focusSearchTrigger) { _ in
-            if isCompactToolbar {
+            if !showsInlineSearch {
                 viewModel.isCompactSearchExpanded = true
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -612,7 +687,7 @@ struct ContentView: View {
     // MARK: - 响应式顶部功能栏
     private var responsiveTopToolbar: some View {
         VStack(spacing: 0) {
-            HStack(spacing: isCompactToolbar ? 6 : 10) {
+            HStack(spacing: toolbarSpacing) {
                 // 1. 左侧：唯一的侧边栏（大纲/搜索）开关按钮 + 打开文件按钮
                 HStack(spacing: 5) {
                     Button(action: {
@@ -643,7 +718,7 @@ struct ContentView: View {
 
                 Divider().frame(height: 16)
 
-                // 2. 缩放控制组（缩小 / 实时百分比显示与重置 / 放大）
+                // 2. 缩放控制组（缩小 / 缩放比例菜单 / 放大）
                 HStack(spacing: 3) {
                     Button(action: { viewModel.zoomOut() }) {
                         Image(systemName: "minus.magnifyingglass")
@@ -651,13 +726,7 @@ struct ContentView: View {
                     .help("缩小 15% (⌘-)")
                     .disabled(viewModel.primaryDocument == nil)
 
-                    Button(action: { viewModel.resetZoomToActualSize() }) {
-                        Text("\(viewModel.activeScalePercentage)%")
-                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                            .frame(width: 46)
-                    }
-                    .help("当前缩放比例 \(viewModel.activeScalePercentage)%，点击恢复 100% (⌘0)")
-                    .disabled(viewModel.primaryDocument == nil)
+                    zoomPopupMenu
 
                     Button(action: { viewModel.zoomIn() }) {
                         Image(systemName: "plus.magnifyingglass")
@@ -669,7 +738,7 @@ struct ContentView: View {
 
                 Divider().frame(height: 16)
 
-                // 3. 弹出式分屏与自适应菜单（单屏[默认] / 双屏 / 三屏 / 四屏 / 自适应分屏 / 窗口自适应宽度）
+                // 3. 一级分屏菜单（单屏 / 双屏 / 三屏 / 四屏 / 自适应分屏）
                 layoutPopupMenu
                     .fixedSize()
 
@@ -681,18 +750,18 @@ struct ContentView: View {
 
                 Spacer(minLength: 2)
 
-                // 5. 右侧实时搜索框（已移除右侧重复的侧边栏按钮）
-                if isCompactToolbar {
-                    compactSearchToggleButton
+                // 5. 右侧实时搜索框（窗口不够宽时收成按钮 + 第二行抽屉）
+                if showsInlineSearch {
+                    inlineSearchBar(maxFieldWidth: 175)
                 } else {
-                    inlineSearchBar(maxFieldWidth: isWideToolbar ? 175 : 120)
+                    compactSearchToggleButton
                 }
             }
-            .padding(.horizontal, isCompactToolbar ? 8 : 12)
+            .padding(.horizontal, windowWidth >= 760 ? 12 : 8)
             .padding(.vertical, 7)
 
-            // 小窗口模式下按需展开的第二行搜索栏
-            if isCompactToolbar && (viewModel.isCompactSearchExpanded || !viewModel.searchQuery.isEmpty) {
+            // 窗口放不下内联搜索框时，按需展开的第二行搜索栏
+            if !showsInlineSearch && (viewModel.isCompactSearchExpanded || !viewModel.searchQuery.isEmpty) {
                 Divider()
                 HStack(spacing: 6) {
                     inlineSearchBar(maxFieldWidth: .infinity)
@@ -714,43 +783,82 @@ struct ContentView: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    // MARK: - 弹出式菜单（单屏 / 双屏 / 三屏 / 四屏 / 自适应）
+    // MARK: - 缩放比例菜单（预设档位 + 自适应 + 自定义）
+    //
+    // 标签仍实时显示当前百分比：捏合缩放 / ⌘滚轮 / ⌘= 之后用户依然能一眼看到比例，
+    // 只是点击行为从「恢复 100%」变成了「展开菜单」。
+    private var zoomPopupMenu: some View {
+        Menu {
+            ForEach(Self.zoomPresetPercents, id: \.self) { percent in
+                Toggle("\(percent)%", isOn: zoomPresetBinding(percent))
+                    .disabled(viewModel.primaryDocument == nil)
+            }
+
+            Divider()
+
+            Button(action: { viewModel.zoomToFit() }) {
+                Label("自适应（窗口宽度）", systemImage: "arrow.left.and.right.square")
+            }
+            .disabled(viewModel.primaryDocument == nil)
+
+            Divider()
+
+            Button(action: presentCustomZoomPanel) {
+                Label("自定义…", systemImage: "slider.horizontal.3")
+            }
+            .disabled(viewModel.primaryDocument == nil)
+        } label: {
+            // 只放百分比：菜单指示箭头由 Menu 自己绘制，不要再手动加一个
+            Text("\(viewModel.activeScalePercentage)%")
+                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .frame(width: isCompactToolbar ? 58 : 66)
+        .help("当前缩放比例 \(viewModel.activeScalePercentage)% · 点击选择档位、自适应或自定义 (⌘0 恢复 100%)")
+    }
+
+    /// 菜单里勾选状态与缩放档位一一对应；当前比例不是预设值时（如 115%）则都不打勾
+    private func zoomPresetBinding(_ percent: Int) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.activeScalePercentage == percent },
+            set: { isOn in
+                if isOn { viewModel.zoom(toPercent: percent) }
+            }
+        )
+    }
+
+    private func presentCustomZoomPanel() {
+        let parent = WindowPlacement.frontWindow(owning: viewModel)
+        guard let percent = ZoomInputPanel.present(currentPercent: viewModel.activeScalePercentage,
+                                                   parent: parent) else { return }
+        viewModel.zoom(toPercent: percent)
+    }
+
+    // MARK: - 一级分屏菜单（单屏 / 双屏 / 三屏 / 四屏 / 自适应分屏）
+    //
+    // 刻意保持「一级」：不再有「分屏模式 >」这样的子菜单，也没有 Section 标题，
+    // 全部是平级项。缩放相关的「自适应宽度 / 恢复 100%」已移到缩放比例菜单里。
     private var layoutPopupMenu: some View {
         Menu {
-            Section("分屏视图模式") {
-                Picker("分屏模式", selection: $viewModel.layoutMode) {
-                    ForEach(SplitLayoutMode.allCases) { mode in
-                        Label(mode.rawValue, systemImage: mode.symbolName).tag(mode)
-                    }
+            ForEach(SplitLayoutMode.allCases) { mode in
+                Toggle(isOn: layoutModeBinding(mode)) {
+                    Label(mode.rawValue, systemImage: mode.symbolName)
                 }
             }
 
-            Section("页面缩放自适应") {
-                Button(action: { viewModel.zoomToFit() }) {
-                    Label("自适应当前窗口宽度 (⌘9)", systemImage: "arrow.left.and.right.square")
-                }
-                .disabled(viewModel.primaryDocument == nil)
-
-                Button(action: { viewModel.resetZoomToActualSize() }) {
-                    Label("恢复 100% 原始比例 (⌘0)", systemImage: "1.magnifyingglass")
-                }
-                .disabled(viewModel.primaryDocument == nil)
-            }
-
+            // 自适应分屏策略与多屏联动目前只有这一个入口，
+            // 因此仍然放在同一级菜单里（不设子菜单），仅在对应场景下出现。
             if viewModel.layoutMode == .autoByZoom {
-                Section("自适应分屏策略 (\(viewModel.smartStatusLabel))") {
-                    Picker("自适应策略", selection: $viewModel.smartZoomStrategy) {
-                        ForEach(SmartZoomStrategy.allCases) { strategy in
-                            Text(strategy.rawValue).tag(strategy)
-                        }
-                    }
+                Divider()
+                ForEach(SmartZoomStrategy.allCases) { strategy in
+                    Toggle("策略：\(strategy.rawValue)", isOn: smartStrategyBinding(strategy))
                 }
             }
 
             if viewModel.visiblePaneCount > 1 {
-                Section("多屏协同") {
-                    Toggle("多屏联动顺延翻页", isOn: $viewModel.syncPanesScrolling)
-                }
+                Divider()
+                Toggle("多屏联动顺延翻页", isOn: $viewModel.syncPanesScrolling)
             }
         } label: {
             HStack(spacing: 4) {
@@ -761,6 +869,24 @@ struct ContentView: View {
         }
         .frame(width: isCompactToolbar ? 76 : 94)
         .help("点击弹出菜单：切换单屏/双屏/三屏/四屏/自适应模式")
+    }
+
+    private func layoutModeBinding(_ mode: SplitLayoutMode) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.layoutMode == mode },
+            set: { isOn in
+                if isOn { viewModel.layoutMode = mode }
+            }
+        )
+    }
+
+    private func smartStrategyBinding(_ strategy: SmartZoomStrategy) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.smartZoomStrategy == strategy },
+            set: { isOn in
+                if isOn { viewModel.smartZoomStrategy = strategy }
+            }
+        )
     }
 
     // MARK: - 页码跳转组
@@ -1613,6 +1739,15 @@ struct ReaderWindowView: View {
                     )
                 }
             })
+            // 打开文档后让窗口贴合「第一页 100%」（详见 PageFitSizer）。
+            // 窗口创建时就带着文档的情况不会有 onChange，因此 onAppear 也要试一次。
+            .onAppear {
+                PageFitSizer.shared.scheduleFit(viewModel: viewModel)
+            }
+            .onChange(of: viewModel.primaryFileURL) { newValue in
+                guard newValue != nil else { return }
+                PageFitSizer.shared.scheduleFit(viewModel: viewModel)
+            }
     }
 }
 
