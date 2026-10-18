@@ -4,6 +4,14 @@ import AppKit
 import UniformTypeIdentifiers
 import Combine
 
+// MARK: - 侧栏宽度监听（用于「开侧栏时窗口同步加宽」）
+private struct SidebarWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 // MARK: - 自定义 PDFView（支持点击激活分屏、实时监听缩放与拖拽打开 PDF）
 final class InteractivePDFView: PDFView {
     var onActivatePane: (() -> Void)?
@@ -21,11 +29,67 @@ final class InteractivePDFView: PDFView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         registerForDraggedTypes([.fileURL])
+        InteractivePDFView.installScrollZoomMonitorIfNeeded()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerForDraggedTypes([.fileURL])
+        InteractivePDFView.installScrollZoomMonitorIfNeeded()
+    }
+
+    // MARK: - ⌘ + 滚轮缩放
+    //
+    // 为什么不能只重写 scrollWheel：滚动事件由命中测试命中的**最深层视图**接收
+    // （PDFView 内部的 PDFDocumentView / 内部 NSScrollView），PDFView 自己的
+    // scrollWheel 根本不会被调用 —— 于是 ⌘+滚轮 只会被内部滚动视图当成普通翻页。
+    // 因此改用「本地事件监视器」：在事件分发前拦截，再按光标位置找回对应的 PDFView。
+    private static var didInstallScrollZoomMonitor = false
+
+    static func installScrollZoomMonitorIfNeeded() {
+        guard !didInstallScrollZoomMonitor else { return }
+        didInstallScrollZoomMonitor = true
+        NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            InteractivePDFView.handleCommandScrollZoomEvent(event) ? nil : event
+        }
+    }
+
+    private static func handleCommandScrollZoomEvent(_ event: NSEvent) -> Bool {
+        let commandHeld = event.modifierFlags.contains(.command)
+            || NSEvent.modifierFlags.contains(.command)
+        guard commandHeld,
+              let window = event.window,
+              let content = window.contentView else { return false }
+
+        let point = content.convert(event.locationInWindow, from: nil)
+        guard let hit = content.hitTest(point) else { return false }
+
+        var node: NSView? = hit
+        while let current = node {
+            if let pdfView = current as? InteractivePDFView {
+                // 惯性滑行不再缩放，但同样要吃掉，避免缩放刚结束就接着翻页
+                if event.momentumPhase.isEmpty {
+                    pdfView.applyCommandScrollZoom(event)
+                }
+                return true
+            }
+            node = current.superview
+        }
+        return false
+    }
+
+    func applyCommandScrollZoom(_ event: NSEvent) {
+        guard document != nil else { return }
+        let delta = event.scrollingDeltaY
+        guard abs(delta) > 0.0001 else { return }
+        onActivatePane?()
+        // 精确设备（触控板）按点、非精确设备（鼠标滚轮）按格，两套底数让手感接近
+        let factor = event.hasPreciseScrollingDeltas
+            ? pow(1.0018, delta)
+            : pow(1.12, delta)
+        guard factor > 0, abs(factor - 1) > 0.00001 else { return }
+        zoomKeepingPointUnderCursor(by: factor,
+                                    at: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -44,34 +108,11 @@ final class InteractivePDFView: PDFView {
         let commandHeld = event.modifierFlags.contains(.command)
             || NSEvent.modifierFlags.contains(.command)
         if commandHeld {
-            handleCommandScrollZoom(with: event)
+            applyCommandScrollZoom(event)
             return
         }
 
         super.scrollWheel(with: event)
-    }
-
-    /// ⌘ + 滚轮缩放。
-    ///
-    /// 手感参数说明（两处常数就是全部可调项）：
-    ///   · 精确设备（触控板）：scrollingDeltaY 以「点」为单位，一次滑动通常 1~10 点；
-    ///   · 非精确设备（鼠标滚轮）：scrollingDeltaY 以「行」为单位，通常 ±1；
-    /// 两者量级差一个数量级，因此用两套底数，保证「滚一格」和「滑一下」的观感接近。
-    private func handleCommandScrollZoom(with event: NSEvent) {
-        // 惯性事件（松手后的滑行）不再继续缩放，否则会一路放大停不下来
-        guard event.momentumPhase.isEmpty else { return }
-        guard document != nil else { return }
-
-        let delta = event.scrollingDeltaY
-        guard abs(delta) > 0.0001 else { return }
-
-        let factor = event.hasPreciseScrollingDeltas
-            ? pow(1.0018, delta)
-            : pow(1.12, delta)
-        guard factor > 0, abs(factor - 1) > 0.00001 else { return }
-
-        zoomKeepingPointUnderCursor(by: factor,
-                                    at: convert(event.locationInWindow, from: nil))
     }
 
     /// 缩放并保持 `anchorInView` 处的内容不动（光标锚定）。
@@ -625,6 +666,9 @@ struct ContentView: View {
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isPageJumpFocused: Bool
     @State private var windowWidth: CGFloat = 860
+    /// 最近一次实测到的侧栏宽度（只记正数：侧栏关闭后偏好值会归零，但收窗时还要用）
+    @State private var sidebarWidth: CGFloat = 0
+    @State private var hostWindow: NSWindow?
 
     /// 缩放菜单里的固定档位（百分比）
     private static let zoomPresetPercents = [25, 50, 75, 100, 125, 150, 175, 200]
@@ -653,6 +697,14 @@ struct ContentView: View {
             HSplitView {
                 if viewModel.showSidebar {
                     SidebarView(viewModel: viewModel)
+                        .background(
+                            GeometryReader { geo in
+                                Color.clear.preference(
+                                    key: SidebarWidthPreferenceKey.self,
+                                    value: geo.size.width
+                                )
+                            }
+                        )
                 }
 
                 mainReadingArea
@@ -671,6 +723,16 @@ struct ContentView: View {
                 windowWidth = width
             }
         })
+        .background(WindowAccessor { window in
+            hostWindow = window
+        })
+        .onPreferenceChange(SidebarWidthPreferenceKey.self) { width in
+            // 侧栏关闭后该偏好值会归零，这里只记录有效宽度，供「关闭时收窄」使用
+            if width > 1 { sidebarWidth = width }
+        }
+        .onChange(of: viewModel.showSidebar) { isShown in
+            adjustWindowWidthForSidebar(expanding: isShown)
+        }
         .onChange(of: viewModel.focusSearchTrigger) { _ in
             if !showsInlineSearch {
                 viewModel.isCompactSearchExpanded = true
@@ -808,13 +870,22 @@ struct ContentView: View {
             }
             .disabled(viewModel.primaryDocument == nil)
         } label: {
-            // 只放百分比：菜单指示箭头由 Menu 自己绘制，不要再手动加一个
-            Text("\(viewModel.activeScalePercentage)%")
-                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                .lineLimit(1)
-                .fixedSize()
+            // 注意：Menu 的 label 里「文字之后的 Image」会被系统当成菜单图标挪到最前面，
+            // 所以这里的箭头用文字拼接实现，才能稳定落在百分比右侧。
+            (
+                Text("\(viewModel.activeScalePercentage)%")
+                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                + Text("  ⌄")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+            )
         }
-        .frame(width: isCompactToolbar ? 58 : 66)
+        // 用 .menuStyle(.button) + .buttonStyle(.bordered)：系统默认的 Menu 样式
+        // 在窗口激活时会把胶囊填充成蓝色，而 .bordered 按钮是中性灰，与 v1.9.1 一致。
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .menuIndicator(.hidden)
+        .controlSize(.small)
         .help("当前缩放比例 \(viewModel.activeScalePercentage)% · 点击选择档位、自适应或自定义 (⌘0 恢复 100%)")
     }
 
@@ -863,11 +934,21 @@ struct ContentView: View {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: viewModel.layoutMode.symbolName)
-                Text(viewModel.layoutMode.rawValue)
-                    .font(.system(size: 11.5))
+                // 同缩放菜单：箭头用文字拼接，避免被当成菜单图标挪到最左侧
+                (
+                    Text(viewModel.layoutMode.rawValue)
+                        .font(.system(size: 11.5))
+                    + Text("  ⌄")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                )
             }
         }
-        .frame(width: isCompactToolbar ? 76 : 94)
+        // 同上：中性灰胶囊，避免系统默认样式在窗口激活时变蓝
+        .menuStyle(.button)
+        .buttonStyle(.bordered)
+        .menuIndicator(.hidden)
+        .controlSize(.small)
         .help("点击弹出菜单：切换单屏/双屏/三屏/四屏/自适应模式")
     }
 
@@ -887,6 +968,24 @@ struct ContentView: View {
                 if isOn { viewModel.smartZoomStrategy = strategy }
             }
         )
+    }
+
+    // MARK: - 侧边栏展开 / 收起时窗口同步加宽 / 收窄
+    //
+    // 目标：开侧栏后「页面显示区」宽度保持不变（页宽 + 侧栏宽），关掉再收回去。
+    // 侧栏宽度取实测值（HSplitView 可拖动，不能写死），拿不到时按 225pt 兜底。
+    private func adjustWindowWidthForSidebar(expanding: Bool) {
+        guard let window = hostWindow ?? WindowPlacement.frontWindow(owning: viewModel) else { return }
+        // 等 HSplitView 完成一次布局：展开时侧栏刚插进去，宽度还没量出来
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            let width = sidebarWidth > 1 ? sidebarWidth : 225
+            var frame = window.frame
+            let newWidth = max(frame.width + (expanding ? width : -width), window.minSize.width)
+            guard abs(newWidth - frame.width) > 1 else { return }
+            // 只改宽度、保持左上角不动
+            frame.size.width = newWidth
+            window.setFrame(frame, display: true)
+        }
     }
 
     // MARK: - 页码跳转组
