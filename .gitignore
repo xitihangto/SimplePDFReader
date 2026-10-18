@@ -13,3 +13,6 @@ xcuserdata/
 
 # Temporary iconset build dir
 AppIcon.iconset/
+
+# 本地 agent 记忆（不属于项目源码）
+.workbuddy-ai/
