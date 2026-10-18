@@ -506,7 +506,13 @@ struct SidebarView: View {
                 searchContent
             }
         }
-        .frame(minWidth: 185, idealWidth: 225, maxWidth: 300)
+        // 固定宽度（不用 min/ideal/max 区间）：
+        // HSplitView 根本不采用 idealWidth，只在 [min, max] 内按分栏逻辑分配 ——
+        // 首次插入第二个 pane 时按平分算（627/2≈313，被 max 截到 300），
+        // 之后插入时已存在 NSSplitView 会保留阅读区原宽，侧栏只拿到剩余 1pt（被 min 抬到 185）。
+        // 于是首轮窗口 = 页宽+300，次轮 = 页宽+185，看起来「第一次特别宽」。
+        // 钉成单一宽度后两个分支没有可分配的余地，首轮/次轮必然一致；代价是不能拖分隔线。
+        .frame(width: 250)
         .background(Color(NSColor.controlBackgroundColor))
     }
 
